@@ -1,5 +1,5 @@
 {
-  "name": "FreeSteering_Runner",
+  "name": "EndlessRunner_5Lane",
   "tree": {
     "$className": "DataModel",
     "ServerScriptService": {
@@ -9,6 +9,9 @@
       },
       "MagnetManager": {
         "$path": "src/server/MagnetManager.server.lua"
+      },
+      "ProgressionHub": {
+        "$path": "src/server/ProgressionHub.server.lua"
       },
       "Leaderstats": {
         "$path": "src/ServerScriptService/Leaderstats.server.lua"
