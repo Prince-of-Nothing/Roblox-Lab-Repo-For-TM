@@ -24,6 +24,9 @@ local TurnInputEvent     = Remotes:WaitForChild("TurnInput",       20)
 local RunnerAdvanceEvent = Remotes:WaitForChild("RunnerAdvance",   20)
 local SpeedUpdateEvent   = Remotes:WaitForChild("SpeedUpdate",     20)
 local MilestoneUIEvent   = Remotes:WaitForChild("MilestoneUIEvent",20)
+local MagnetStatusEvent  = Remotes:WaitForChild("MagnetStatus",    20)
+
+if not MagnetStatusEvent then warn("[runnerController] MagnetStatus remote not found") end
 
 -- ── Input state ───────────────────────────────────────────────────────────
 local leftHeld  = false
@@ -203,3 +206,29 @@ MilestoneUIEvent.OnClientEvent:Connect(function(distance)
         end
     end)
 end)
+
+-- ── Magnet status HUD ─────────────────────────────────────────────────────
+-- Shows a visible indicator while the magnet power-up is active.
+local magnetGui        = Instance.new("ScreenGui")
+magnetGui.Name         = "MagnetHUD"
+magnetGui.ResetOnSpawn = false
+magnetGui.Parent       = player.PlayerGui
+
+local magnetLabel                  = Instance.new("TextLabel")
+magnetLabel.Name                   = "MagnetLabel"
+magnetLabel.Size                   = UDim2.new(0.25, 0, 0.06, 0)
+magnetLabel.Position               = UDim2.new(0.375, 0, 0.02, 0)
+magnetLabel.BackgroundColor3       = Color3.fromRGB(0, 80, 200)
+magnetLabel.BackgroundTransparency = 0.3
+magnetLabel.TextColor3             = Color3.fromRGB(255, 255, 255)
+magnetLabel.TextScaled             = true
+magnetLabel.Font                   = Enum.Font.GothamBold
+magnetLabel.Text                   = "MAGNET ACTIVE"
+magnetLabel.Visible                = false
+magnetLabel.Parent                 = magnetGui
+
+if MagnetStatusEvent then
+    MagnetStatusEvent.OnClientEvent:Connect(function(active)
+        magnetLabel.Visible = active == true
+    end)
+end

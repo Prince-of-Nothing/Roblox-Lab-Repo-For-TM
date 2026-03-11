@@ -221,7 +221,22 @@ local function spawnOnSegment(segData)
                 if ls and ls:FindFirstChild("Score") then
                     ls.Score.Value = ls.Score.Value + 1
                 end
+                -- Also increment Coins if present (from Leaderstats.server.lua)
+                if ls and ls:FindFirstChild("Coins") then
+                    ls.Coins.Value = ls.Coins.Value + 1
+                end
                 cup:Destroy()
+
+                -- Play pickup sound at the player's root part
+                local root = char:FindFirstChild("HumanoidRootPart")
+                if root then
+                    local snd       = Instance.new("Sound")
+                    snd.SoundId     = "rbxassetid://3124262382"
+                    snd.Volume      = 0.6
+                    snd.Parent      = root
+                    snd:Play()
+                    game:GetService("Debris"):AddItem(snd, 2)
+                end
             end
         end)
     end
@@ -342,24 +357,37 @@ end
 -- ── Player data ───────────────────────────────────────────────────────────
 local playerData = {}
 
-local function setupLeaderstats(player)
-    local ls    = Instance.new("Folder")
-    ls.Name     = "leaderstats"
-    ls.Parent   = player
+-- Leaderstats.server.lua (also in ServerScriptService) creates the
+-- "leaderstats" folder with a "Coins" IntValue.  We add "Score" and
+-- "Distance" to that existing folder rather than creating a duplicate.
+local function ensureLeaderstats(player)
+    -- Use WaitForChild alone to avoid a TOCTOU race between FindFirstChild
+    -- and WaitForChild.  Five-second timeout is generous for server startup.
+    local ls = player:WaitForChild("leaderstats", 5)
+    if not ls then
+        -- Fallback: create our own if Leaderstats.server.lua is absent.
+        ls        = Instance.new("Folder")
+        ls.Name   = "leaderstats"
+        ls.Parent = player
+    end
 
-    local score       = Instance.new("IntValue")
-    score.Name        = "Score"
-    score.Value       = 0
-    score.Parent      = ls
+    if not ls:FindFirstChild("Score") then
+        local score       = Instance.new("IntValue")
+        score.Name        = "Score"
+        score.Value       = 0
+        score.Parent      = ls
+    end
 
-    local dist        = Instance.new("IntValue")
-    dist.Name         = "Distance"
-    dist.Value        = 0
-    dist.Parent       = ls
+    if not ls:FindFirstChild("Distance") then
+        local dist        = Instance.new("IntValue")
+        dist.Name         = "Distance"
+        dist.Value        = 0
+        dist.Parent       = ls
+    end
 end
 
 Players.PlayerAdded:Connect(function(player)
-    setupLeaderstats(player)
+    ensureLeaderstats(player)
 
     playerData[player] = {
         speed            = FORWARD_SPEED,

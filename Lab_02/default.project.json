@@ -9,6 +9,9 @@
       },
       "MagnetManager": {
         "$path": "src/server/MagnetManager.server.lua"
+      },
+      "Leaderstats": {
+        "$path": "src/ServerScriptService/Leaderstats.server.lua"
       }
     },
     "StarterPlayer": {
