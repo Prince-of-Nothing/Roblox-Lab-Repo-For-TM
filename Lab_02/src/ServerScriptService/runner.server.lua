@@ -1,603 +1,799 @@
-local Players = game:GetService("Players")
-local Workspace = game:GetService("Workspace")
-local RunService = game:GetService("RunService")
+--[[
+  runner.server.lua  -  5-Lane Endless Runner, Server Authority
+  ================================================================
+
+  World Structure
+  Five parallel lanes (indices 1-5, X positions: -20, -10, 0, 10, 20 studs).
+  The track extends in the -Z direction. Players are propelled forward
+  automatically via LinearVelocity; they only control lateral lane changes.
+
+  Difficulty
+  Selected by the client before each run. Controls:
+  obstaclesPerRow - how many of the 5 lanes are blocked per obstacle row
+  safeLanes       - guaranteed minimum clear lanes per row
+  speedMultiplier - scales base forward speed
+  clusterChance   - probability that blocked lanes form an adjacent cluster
+
+  Obstacle Types
+  solid_barrier  - requires lane switch
+  low_barrier    - can be cleared with jump ability
+  high_barrier   - can be cleared with slide mechanic
+  hazard_tile    - damaging floor tile (CanCollide false, Touched detection)
+  moving_barrier - oscillates between two adjacent lanes
+
+  Collectibles
+  energy_shard   - primary currency (+1 coin)
+  data_cube      - rare currency (+5 coins)
+  velocity_orb   - temporary speed boost
+  phase_fragment - +1 ability charge
+  shield_item    - +1 shield (absorbs one collision)
+
+  Health System
+  Players start with 3 HP. Shields absorb hits first. When health reaches 0
+  the run ends and results are sent to the client.
+
+  Abilities (require phase_fragment charges)
+  phase         - pass through obstacles for 2 s
+  invincibility - no collision damage for 3 s
+  dash          - instant teleport 2 lanes right
+  timeslow      - reduce world speed to 35% for 4 s
+
+  Speed System
+  base = BASE_FORWARD_SPEED x difficultySpeedMultiplier
+  Auto-ramp every SPEED_RAMP_INTERVAL seconds.
+  Milestone bonus (+1.5 studs/s) every 100 m.
+  Velocity_orb grants temporary +8 studs/s for 5 s.
+
+  Score Calculation
+  (distance + items x 2) x difficultyMultiplier + no-hit-time-bonus
+
+  Biomes
+  Visual floor/wall colour changes at distance milestones.
+  City Neon -> Lava Factory -> Frozen Rail Yard -> Neon Jungle -> Deep Space
+--]]
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local ServerStorage = game:GetService("ServerStorage")
-local cupcakeTemplate = ServerStorage:WaitForChild("Cupcake")
-local milestoneEvent = ReplicatedStorage:FindFirstChild("MilestoneUIEvent")
-local eatingSoundEvent = ReplicatedStorage:FindFirstChild("EatCupcakeSound")
-if not eatingSoundEvent then
-	eatingSoundEvent = Instance.new("RemoteEvent")
-	eatingSoundEvent.Name = "EatCupcakeSound"
-	eatingSoundEvent.Parent = ReplicatedStorage
+local CollectionService = game:GetService("CollectionService")
+local Workspace         = game:GetService("Workspace")
+
+-- Constants
+local NUM_LANES             = 5
+local LANE_X                = { -20, -10, 0, 10, 20 }
+local LANE_WIDTH            = 10
+
+local BASE_FORWARD_SPEED    = 22
+local SPEED_RAMP            = 0.4
+local SPEED_RAMP_INTERVAL   = 5
+local MILESTONE_SPEED_BONUS = 1.5
+local MAX_SPEED             = 90
+
+local FLOOR_Y               = 50
+local FLOOR_THICK           = 2
+local SEGMENT_LENGTH        = 60
+local SEGMENT_WIDTH         = 52
+local SEGMENTS_AHEAD        = 10
+local SAFE_ZONE_SEGS        = 3
+local OBS_ROWS_PER_SEG      = 3
+
+-- Difficulty Settings
+local DIFFICULTY = {
+    easy       = { obstaclesPerRow=1, safeLanes=4, speedMult=1.0, clusterChance=0.00, name="Easy"       },
+    normal     = { obstaclesPerRow=2, safeLanes=3, speedMult=1.2, clusterChance=0.10, name="Normal"     },
+    medium     = { obstaclesPerRow=3, safeLanes=2, speedMult=1.5, clusterChance=0.25, name="Medium"     },
+    hard       = { obstaclesPerRow=4, safeLanes=1, speedMult=2.0, clusterChance=0.50, name="Hard"       },
+    impossible = { obstaclesPerRow=5, safeLanes=0, speedMult=2.5, clusterChance=0.70, name="Impossible" },
+}
+
+-- Obstacle Type Definitions (w = spawn weight)
+local OBS_DEFS = {
+    solid_barrier  = { h=5,   color=BrickColor.new("Bright red"),     w=40, jumpable=false, slidable=false, hazard=false, moving=false },
+    low_barrier    = { h=2.5, color=BrickColor.new("Bright orange"),  w=25, jumpable=true,  slidable=false, hazard=false, moving=false },
+    high_barrier   = { h=8,   color=BrickColor.new("Dark red"),       w=20, jumpable=false, slidable=true,  hazard=false, moving=false },
+    hazard_tile    = { h=0.4, color=BrickColor.new("Neon orange"),    w=10, jumpable=false, slidable=false, hazard=true,  moving=false },
+    moving_barrier = { h=5,   color=BrickColor.new("Bright violet"),  w=5,  jumpable=false, slidable=false, hazard=false, moving=true  },
+}
+local OBS_TOTAL_W = 0
+for _, d in pairs(OBS_DEFS) do OBS_TOTAL_W = OBS_TOTAL_W + d.w end
+
+-- Collectible Type Definitions
+local COL_DEFS = {
+    energy_shard   = { color=BrickColor.new("Bright yellow"), coinVal=1,  w=55 },
+    data_cube      = { color=BrickColor.new("Cyan"),          coinVal=5,  w=10, rare=true },
+    velocity_orb   = { color=BrickColor.new("Bright green"),  speedBoost=8, boostDur=5, w=15 },
+    phase_fragment = { color=BrickColor.new("Bright violet"), abilCharge=true, w=12 },
+    shield_item    = { color=BrickColor.new("White"),         shield=true, w=8 },
+}
+local COL_TOTAL_W = 0
+for _, d in pairs(COL_DEFS) do COL_TOTAL_W = COL_TOTAL_W + d.w end
+
+-- Biome Definitions
+local BIOMES = {
+    { name="City Neon Zone",   floorBC=BrickColor.new("Dark blue"),    wallBC=BrickColor.new("Cyan"),          trigDist=0    },
+    { name="Lava Factory",     floorBC=BrickColor.new("Dark orange"),  wallBC=BrickColor.new("Bright red"),    trigDist=300  },
+    { name="Frozen Rail Yard", floorBC=BrickColor.new("White"),        wallBC=BrickColor.new("Light blue"),    trigDist=700  },
+    { name="Neon Jungle",      floorBC=BrickColor.new("Bright green"), wallBC=BrickColor.new("Dark green"),    trigDist=1200 },
+    { name="Deep Space",       floorBC=BrickColor.new("Black"),        wallBC=BrickColor.new("Bright violet"), trigDist=2000 },
+}
+
+-- Ability Cooldowns (seconds)
+local ABILITY_CD = { phase=8, invincibility=10, dash=5, timeslow=12 }
+
+-- Remote Events Setup
+local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
+if not Remotes then
+    Remotes = Instance.new("Folder")
+    Remotes.Name = "Remotes"
+    Remotes.Parent = ReplicatedStorage
 end
-if not milestoneEvent then
-    milestoneEvent = Instance.new("RemoteEvent")
-    milestoneEvent.Name = "MilestoneUIEvent"
-    milestoneEvent.Parent = ReplicatedStorage
+
+local function getOrMake(name, cls)
+    local e = Remotes:FindFirstChild(name)
+    if not e then
+        e = Instance.new(cls or "RemoteEvent")
+        e.Name = name
+        e.Parent = Remotes
+    end
+    return e
 end
 
--- Wait for MagnetManager to be available from _G (loaded by MagnetManager.server.lua)
-local MagnetManager
-task.spawn(function()
-	local timeout = 0
-	while not _G.MagnetManager and timeout < 50 do
-		task.wait(0.1)
-		timeout = timeout + 1
-	end
-	MagnetManager = _G.MagnetManager
-	if MagnetManager then
-		print("runner.server.lua: MagnetManager connected")
-	else
-		warn("runner.server.lua: MagnetManager not found in _G after timeout")
-	end
-end)
+local SpeedUpdateEvt    = getOrMake("SpeedUpdate")
+local MilestoneEvt      = getOrMake("MilestoneUIEvent")
+local HealthUpdateEvt   = getOrMake("HealthUpdate")
+local ShieldUpdateEvt   = getOrMake("ShieldUpdate")
+local AbilityUpdateEvt  = getOrMake("AbilityUpdate")
+local RunEndEvt         = getOrMake("RunEnd")
+local RunStartEvt       = getOrMake("RunStart")
+local BiomeChangeEvt    = getOrMake("BiomeChange")
+local CurrencyUpdateEvt = getOrMake("CurrencyUpdate")
+local UpgradeResultEvt  = getOrMake("UpgradeResult")
+local ObstacleHitEvt    = getOrMake("ObstacleHit")
+local AbilityCDEvt      = getOrMake("AbilityCooldown")
+local LaneSwitchEvt     = getOrMake("LaneSwitch")
+local PlayerJumpEvt     = getOrMake("PlayerJump")
+local PlayerSlideEvt    = getOrMake("PlayerSlide")
+local UseAbilityEvt     = getOrMake("UseAbility")
+local SelectDiffEvt     = getOrMake("SelectDifficulty")
+local BuyUpgradeEvt     = getOrMake("BuyUpgrade")
+local RunnerAdvanceEvt  = getOrMake("RunnerAdvance")
+local RequestRunEvt     = getOrMake("RequestRun")
+getOrMake("MagnetStatus")
 
-local LANE_X = { -10, 0, 10 }
-local OBSTACLE_PER_LANE_CHANCE = 0.45 -- chance each lane gets an obstacle on a segment
-local COIN_PER_LANE_CHANCE = 0.25     -- optional: coins per lane
+-- Track state
+local trackFolder = Instance.new("Folder")
+trackFolder.Name = "TrackSegments"
+trackFolder.Parent = Workspace
 
-local FORWARD_SPEED = 22
+local segments   = {}
+local nextSegIdx = 0
+local movObstacles = {}
 
--- Track each player's lane and movement
-local playerData = {}
+-- _G.playerPersist  – shared with ProgressionHub.server.lua
+--   Keyed by tostring(player.UserId).  Survives between runs in the same
+--   server session but is NOT persisted to DataStore; production deployments
+--   should add DataStore save/load here.
+_G.playerPersist = _G.playerPersist or {}
 
--- create / get remotes
-local advanceEvent = ReplicatedStorage:FindFirstChild("RunnerAdvance")
-if not advanceEvent then
-	advanceEvent = Instance.new("RemoteEvent")
-	advanceEvent.Name = "RunnerAdvance"
-	advanceEvent.Parent = ReplicatedStorage
+local function getPersist(player)
+    local uid = tostring(player.UserId)
+    if not _G.playerPersist[uid] then
+        _G.playerPersist[uid] = { currency=0, upgrades={} }
+    end
+    return _G.playerPersist[uid]
 end
 
-local laneEvent = ReplicatedStorage:FindFirstChild("LaneSwitch")
-if not laneEvent then
-	laneEvent = Instance.new("RemoteEvent")
-	laneEvent.Name = "LaneSwitch"
-	laneEvent.Parent = ReplicatedStorage
+-- _G.playerRunData  – per-run state for each player.
+--   Reset each run via initRun(); read by obstacle/collectible touch handlers
+--   that are spawned inside closures and cannot receive the table by reference.
+_G.playerRunData = {}
+
+local function initRun(player, diff)
+    local s     = DIFFICULTY[diff] or DIFFICULTY.normal
+    local persist = getPersist(player)
+    local upg   = persist.upgrades
+    local startSlowBonus = (upg.start_slow or 0) * 0.08
+    local abilCapBonus   = upg.ability_cap or 0
+    local baseSpd = BASE_FORWARD_SPEED * s.speedMult * (1 - startSlowBonus)
+    local pd = {
+        difficulty       = diff,
+        settings         = s,
+        laneIndex        = 3,
+        currentSpeed     = baseSpd,
+        speedBoost       = 0,
+        health           = 3,
+        maxHealth        = 3,
+        shields          = 0,
+        abilityCharges   = 1 + abilCapBonus,
+        maxAbilCharges   = 3 + abilCapBonus,
+        score            = 0,
+        distanceTraveled = 0,
+        lastMilestone    = 0,
+        lastRampTime     = os.clock(),
+        energyShards     = 0,
+        dataCubes        = 0,
+        isAlive          = true,
+        isPhasing        = false,
+        isInvincible     = false,
+        isSliding        = false,
+        noHitBonus       = true,
+        abilityCooldown  = {},
+        linearVelocity   = nil,
+        rootPart         = nil,
+        humanoid         = nil,
+        runStartTime     = os.clock(),
+        runEnded         = false,
+    }
+    _G.playerRunData[player] = pd
+    return pd
 end
 
-local jumpEvent = ReplicatedStorage:FindFirstChild("PlayerJump")
-if not jumpEvent then
-	jumpEvent = Instance.new("RemoteEvent")
-	jumpEvent.Name = "PlayerJump"
-	jumpEvent.Parent = ReplicatedStorage
-end
-
-local speedUpdateEvent = ReplicatedStorage:FindFirstChild("SpeedUpdate")
-if not speedUpdateEvent then
-	speedUpdateEvent = Instance.new("RemoteEvent")
-	speedUpdateEvent.Name = "SpeedUpdate"
-	speedUpdateEvent.Parent = ReplicatedStorage
-end
-local rainbowUIEvent = ReplicatedStorage:FindFirstChild("RainbowGateUIEvent")
-if not rainbowUIEvent then
-	rainbowUIEvent = Instance.new("RemoteEvent")
-	rainbowUIEvent.Name = "RainbowGateUIEvent"
-	rainbowUIEvent.Parent = ReplicatedStorage
-end
--- Helper to get root part (works with custom characters without HumanoidRootPart)
+-- Utilities
 local function getRootPart(char)
-	if not char then return nil end
-	local hrp = char:FindFirstChild("HumanoidRootPart")
-	if hrp then return hrp end
-	if char.PrimaryPart then return char.PrimaryPart end
-	local hum = char:FindFirstChildOfClass("Humanoid")
-	if hum and hum.RootPart then return hum.RootPart end
-	return char:FindFirstChildWhichIsA("BasePart")
+    if not char then return nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp then return hrp end
+    if char.PrimaryPart then return char.PrimaryPart end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum and hum.RootPart then return hum.RootPart end
+    return char:FindFirstChildWhichIsA("BasePart")
 end
 
--- Setup movement constraints on character
-local function setupCharacterMovement(player, char)
-	task.wait(0.3)
-
-	local rootPart = getRootPart(char)
-	local hum = char:FindFirstChildOfClass("Humanoid")
-
-	if not rootPart or not hum then
-		warn("Could not find root part or humanoid for", player.Name)
-		return
-	end
-
-	-- Initialize player data
-	playerData[player] = {
-		laneIndex = 2,
-		rootPart = rootPart,
-		humanoid = hum,
-		currentSpeed = FORWARD_SPEED,  -- Track current speed
-		distanceTravelled = 0,
-		milestoneIndex = 0
-	}
-
-	-- Remove any existing movers
-	local existingVel = rootPart:FindFirstChild("RunnerVelocity")
-	if existingVel then existingVel:Destroy() end
-	local existingGyro = rootPart:FindFirstChild("RunnerGyro")
-	if existingGyro then existingGyro:Destroy() end
-	local existingAttach = rootPart:FindFirstChild("RunnerAttachment")
-	if existingAttach then existingAttach:Destroy() end
-
-	-- Create attachment
-	local attachment = Instance.new("Attachment")
-	attachment.Name = "RunnerAttachment"
-	attachment.Parent = rootPart
-
-	-- LinearVelocity for forward movement
-	local linearVel = Instance.new("LinearVelocity")
-	linearVel.Name = "RunnerVelocity"
-	linearVel.Attachment0 = attachment
-	linearVel.RelativeTo = Enum.ActuatorRelativeTo.World
-	linearVel.MaxForce = 100000
-	linearVel.VectorVelocity = Vector3.new(0, 0, -FORWARD_SPEED)
-	linearVel.Parent = rootPart
-
-	-- Store reference to LinearVelocity for speed updates
-	playerData[player].linearVel = linearVel
-
-	-- Send initial speed multiplier to client (1.0x)
-	speedUpdateEvent:FireClient(player, 1.0)
-
-	-- AlignOrientation to face forward
-	local alignOri = Instance.new("AlignOrientation")
-	alignOri.Name = "RunnerGyro"
-	alignOri.Attachment0 = attachment
-	alignOri.Mode = Enum.OrientationAlignmentMode.OneAttachment
-	alignOri.MaxTorque = 200000
-	alignOri.Responsiveness = 100
-	alignOri.CFrame = CFrame.Angles(0, 0, 0)
-	alignOri.Parent = rootPart
-
-	-- Position in center lane
-	local pos = rootPart.Position
-	rootPart.CFrame = CFrame.new(LANE_X[2], pos.Y, pos.Z)
+local function makePart(sz, bc, anchored, canCollide, mat)
+    local p         = Instance.new("Part")
+    p.Size          = sz
+    p.Anchored      = (anchored  ~= false)
+    p.CanCollide    = (canCollide ~= false)
+    p.BrickColor    = bc  or BrickColor.new("Medium stone grey")
+    p.Material      = mat or Enum.Material.SmoothPlastic
+    p.TopSurface    = Enum.SurfaceType.Smooth
+    p.BottomSurface = Enum.SurfaceType.Smooth
+    return p
 end
 
--- Handle lane switch from client
-laneEvent.OnServerEvent:Connect(function(player, newLaneIndex)
-	local data = playerData[player]
-	if not data then return end
-
-	newLaneIndex = math.clamp(newLaneIndex, 1, #LANE_X)
-	data.laneIndex = newLaneIndex
-
-	local rootPart = data.rootPart
-	if rootPart and rootPart.Parent then
-		local pos = rootPart.Position
-		local targetX = LANE_X[newLaneIndex]
-		rootPart.CFrame = CFrame.new(targetX, pos.Y, pos.Z)
-	end
-end)
-
--- Handle jump from client
-jumpEvent.OnServerEvent:Connect(function(player)
-	local data = playerData[player]
-	if not data then return end
-
-	local hum = data.humanoid
-	if hum and hum.Parent then
-		hum.Jump = true
-	end
-end)
-
--- Clean up when player leaves
-Players.PlayerRemoving:Connect(function(player)
-	playerData[player] = nil
-end)
-
--- SETTINGS
-local SEGMENT_LENGTH = 50
-local SEGMENT_WIDTH = 30
-local START_Y = 50
-local SEGMENTS_AHEAD = 8       -- how many we keep in front
-local SAFE_ZONE_SEGMENTS = 2   -- No obstacles or cupcakes in first N segments
-local COIN_CHANCE = 0.4
-local OBSTACLE_CHANCE = 0.3
-local SPAWN_START_AHEAD = 8  -- studs; ~2 meters ≈ 2 studs, but use 6–12 for visibility
-
--- this runner will have ONE track for now
-local segments = {}  -- array of segment models
-local lastIndexSpawned = -1
-local function randomForwardZ(margin)
-	-- spawn only in the "front" part of the segment (toward -Z)
-	local minZ = -SEGMENT_LENGTH/2 + margin
-	local maxZ = -SPAWN_START_AHEAD -- must stay negative to be in front direction
-	if maxZ <= minZ then
-		maxZ = minZ + 1
-	end
-	return math.random(minZ, maxZ)
+local function pickWeighted(defs, total)
+    local r, cum = math.random(1, total), 0
+    for name, def in pairs(defs) do
+        cum = cum + def.w
+        if r <= cum then return name, def end
+    end
+    local n, d = next(defs); return n, d
 end
 
--- local function placeModelAt(model: Model, worldPos: Vector3)
--- 		-- Find a PrimaryPart (or assign one)
--- 		if not model.PrimaryPart then
--- 			local pp = model:FindFirstChildWhichIsA("BasePart", true)
--- 			if pp then model.PrimaryPart = pp end
--- 		end
--- 		if not model.PrimaryPart then
--- 			warn("CupcakePickup has no BasePart inside it.")
--- 			return
--- 		end
-
--- 		-- Make sure parts behave like a pickup
--- 		for _, d in ipairs(model:GetDescendants()) do
--- 			if d:IsA("BasePart") then
--- 				d.Anchored = true
--- 				d.CanCollide = false
--- 				d.CanTouch = true   -- IMPORTANT if we use touch pickup
--- 				d.CanQuery = true
--- 			end
--- 		end
-
--- 		-- Lift by half height so it sits on top of floor
--- 		local yLift = (model.PrimaryPart.Size.Y / 2) + 1.5
-
--- 		model:PivotTo(CFrame.new(worldPos + Vector3.new(0, yLift, 0)))
--- 	end
-
-
--- make a part helper
-local function makePart(size, color, anchored, canCollide)
-	local p = Instance.new("Part")
-	p.Size = size
-	p.Anchored = anchored
-	p.CanCollide = canCollide
-	p.Color = color
-	p.Material = Enum.Material.SmoothPlastic
-	p.TopSurface = Enum.SurfaceType.Smooth
-	p.BottomSurface = Enum.SurfaceType.Smooth
-	return p
+local function getBiome(dist)
+    local cur = BIOMES[1]
+    for _, b in ipairs(BIOMES) do
+        if dist >= b.trigDist then cur = b end
+    end
+    return cur
 end
 
--- create one platform at index (0,1,2,3...) on NEGATIVE Z
-local function createSegment(index)
-	local model = Instance.new("Model")
-	model.Name = "Segment_" .. index
-
-	local floor = makePart(
-		Vector3.new(SEGMENT_WIDTH, 2, SEGMENT_LENGTH),
-		Color3.fromRGB(121, 200, 245),
-		true,
-		true
-	)
-	floor.CFrame = CFrame.new(0, START_Y, -index * SEGMENT_LENGTH)
-	floor.Name = "Floor"
-	floor.Parent = model
-	model.PrimaryPart = floor
-	local spawnLane = {}
-	local count = 0
-
-	-- Only spawn obstacles if not in safe zone
-	if index >= SAFE_ZONE_SEGMENTS then
-		for i = 1, #LANE_X do
-			spawnLane[i] = (math.random() < OBSTACLE_PER_LANE_CHANCE)
-			if spawnLane[i] then count += 1 end
-		end
-
-		-- prevent 3/3 blocked: force one random lane to be empty
-		if count == #LANE_X then
-			local open = math.random(1, #LANE_X)
-			spawnLane[open] = false
-			count -= 1
-		end
-	else
-		-- In safe zone: no obstacles
-		for i = 1, #LANE_X do
-			spawnLane[i] = false
-		end
-	end
-
-for i, laneX in ipairs(LANE_X) do
--- remember obstacle Z for this lane (if any)
-	local obstacleZ = nil
-
-	-- spawn obstacle if pattern says so
-	if spawnLane[i] then
-		local obstacle = makePart(Vector3.new(4, 6, 4), Color3.fromRGB(180, 20, 20), true, true)
-		obstacle.Name = "Obstacle"
-
-		obstacleZ = randomForwardZ(8)
-		obstacle.CFrame = floor.CFrame * CFrame.new(laneX, 4, obstacleZ)
-		obstacle.Parent = model
-
-		local hitOnce = false
-		obstacle.Touched:Connect(function(hit)
-			if hitOnce then return end
-			local character = hit:FindFirstAncestorOfClass("Model")
-			if not character then return end
-
-			local plr = Players:GetPlayerFromCharacter(character)
-			if not plr then return end
-
-			local hum = character:FindFirstChildOfClass("Humanoid")
-			if hum and hum.Health > 0 then
-				hitOnce = true
-				hum.Health = 0
-			end
-		end)
-	end
-
-	-- cupcake spawn - only if not in safe zone
-	if index >= SAFE_ZONE_SEGMENTS and math.random() < COIN_PER_LANE_CHANCE then
-		local cupcake = cupcakeTemplate:Clone()
-		cupcake.Name = "Cupcake"
-
-		-- ensure PrimaryPart exists
-		if not cupcake.PrimaryPart then
-			local pp = cupcake:FindFirstChildWhichIsA("BasePart", true)
-			if pp then cupcake.PrimaryPart = pp end
-		end
-
-		if not cupcake.PrimaryPart then
-			-- If the cupcake model isn't set up correctly, skip placing this cupcake
-			warn("CupcakePickup has no BasePart inside it, can't place this cupcake. Skipping.")
-		else
-			-- make pickup parts
-			for _, d in ipairs(cupcake:GetDescendants()) do
-				if d:IsA("BasePart") then
-					d.Anchored = true
-					d.CanCollide = false
-					d.CanTouch = true
-					d.CanQuery = false
-				end
-			end
-
-			-- pick a cupcake Z that doesn't overlap the obstacle in same lane
-			local cupcakeZ = randomForwardZ(10)
-			local MIN_GAP_Z = 10 -- studs between cupcake and obstacle
-
-			if obstacleZ then
-				local tries = 0
-				while math.abs(cupcakeZ - obstacleZ) < MIN_GAP_Z and tries < 12 do
-					cupcakeZ = randomForwardZ(10)
-					tries += 1
-				end
-
-				-- fallback: if still too close, shove it forward/back
-				if math.abs(cupcakeZ - obstacleZ) < MIN_GAP_Z then
-					cupcakeZ = obstacleZ + (cupcakeZ >= obstacleZ and MIN_GAP_Z or -MIN_GAP_Z)
-					cupcakeZ = math.clamp(cupcakeZ, -SEGMENT_LENGTH/2 + 10, SEGMENT_LENGTH/2 - 10)
-				end
-			end
-
-			-- place it above the floor
-			local floorTopY = floor.Position.Y+2 + (floor.Size.Y / 2)
-			local yLift = (cupcake.PrimaryPart.Size.Y / 2) + 0.5
-
-			local worldPos = Vector3.new(floor.Position.X + laneX, floorTopY + yLift, floor.Position.Z + cupcakeZ)
-			cupcake:PivotTo(CFrame.new(worldPos))
-			cupcake.Parent = model
-
-			-- touch pickup (on PrimaryPart)
-			local collected = false
-			cupcake.PrimaryPart.Touched:Connect(function(hit)
-				if collected then return end
-
-				local character = hit:FindFirstAncestorOfClass("Model")
-				if not character then return end
-
-				local plr = Players:GetPlayerFromCharacter(character)
-				if not plr then return end
-
-				local ls = plr:FindFirstChild("leaderstats")
-				local score = ls and ls:FindFirstChild("Score") -- <- HERE
-				if not score then return end
-
-				collected = true
-				score.Value += 1
-				local head = character:FindFirstChild("Head")
-if head then
-					local sparkle = Instance.new("ParticleEmitter")
-sparkle.Color = ColorSequence.new(Color3.fromRGB(255, 120, 200))
-					sparkle.Texture = "rbxassetid://243660364"
-					sparkle.Lifetime = NumberRange.new(0.5,1)
-					sparkle.Speed = NumberRange.new(4,8)
-					sparkle.SpreadAngle = Vector2.new(360,360)
-
-					-- IMPORTANT visibility settings
-					sparkle.Size = NumberSequence.new(1)
-					sparkle.Transparency = NumberSequence.new(0)
-					sparkle.LightEmission = 1
-
-					sparkle.Rate = 0
-					sparkle.Parent = head
-
-					sparkle:Emit(40)
-
-					task.delay(1,function()
-						sparkle:Destroy()
-					end)
-				end
-				cupcake:Destroy()
-				eatingSoundEvent:FireClient(plr)
-
-			end)
-		end
-
-
-	end
-end
-
-	-- let MagnetManager possibly add magnets to this segment
-	if MagnetManager and type(MagnetManager.SpawnOnSegment) == "function" then
-		-- pcall to avoid breaking segment creation if the module errors
-		local ok, err = pcall(function() MagnetManager.SpawnOnSegment(model) end)
-		if not ok then warn("MagnetManager.SpawnOnSegment error: ", err) end
-	end
-
-	-- Add a Rainbow Gate every 10 segments
-	if index % 10 == 0 then
-		local rainbowTemplate = ServerStorage:FindFirstChild("RainbowGate") or ReplicatedStorage:FindFirstChild("RainbowGate")
-		-- If the asset wasn't present at initial check, try a short WaitForChild to handle startup ordering
-		if not rainbowTemplate then
-			local ok = pcall(function()
-				-- try ServerStorage first with a short timeout
-				rainbowTemplate = ServerStorage:WaitForChild("RainbowGate", 1)
-			end)
-			if not rainbowTemplate then
-				-- fallback to ReplicatedStorage as a last resort
-				pcall(function()
-					rainbowTemplate = ReplicatedStorage:WaitForChild("RainbowGate", 1)
-				end)
-			end
-		end
-		if rainbowTemplate then
-			local gate = rainbowTemplate:Clone()
-			gate.Name = "RainbowGate_Segment_" .. index
-
-			-- ensure PrimaryPart exists
-			if not gate.PrimaryPart then
-				local pp = gate:FindFirstChildWhichIsA("BasePart", true)
-				if pp then gate.PrimaryPart = pp end
-			end
-
-			if gate.PrimaryPart then
-				-- make gate parts non-physical and anchored
-				for _, d in ipairs(gate:GetDescendants()) do
-					if d:IsA("BasePart") then
-						d.Anchored = true
-						d.CanCollide = false
-						d.CanTouch = true
-						d.CanQuery = false
-					end
-				end
-
-				-- place the gate at the front edge of the floor (toward -Z)
-				local frontZ = floor.Position.Z - (SEGMENT_LENGTH / 2) - 2
-				local gateY = floor.Position.Y + (floor.Size.Y / 2) + (gate.PrimaryPart.Size.Y / 2)
-				local gatePos = Vector3.new(floor.Position.X, gateY, frontZ)
-				gate:PivotTo(CFrame.new(gatePos))
-				gate.Parent = model
-
-				-- Add touch detection for speed boost
-				local SPEED_BOOST = 5  -- Boost speed by 5 studs/sec per gate
-				local touchedPlayers = {}  -- Track who's already touched this gate
-
-				gate.PrimaryPart.Touched:Connect(function(hit)
-					local character = hit:FindFirstAncestorOfClass("Model")
-					if not character then return end
-
-					local player = Players:GetPlayerFromCharacter(character)
-					if not player then return end
-
-					-- Only boost once per player per gate
-					local gateId = gate:GetFullName()
-					local playerGateKey = player.UserId .. "_" .. gateId
-					if touchedPlayers[playerGateKey] then return end
-					touchedPlayers[playerGateKey] = true
-
-					-- Increase player's speed
-					local data = playerData[player]
-					if data and data.linearVel then
-						data.currentSpeed = data.currentSpeed + SPEED_BOOST
-						data.linearVel.VectorVelocity = Vector3.new(0, 0, -data.currentSpeed)
-
-						-- Calculate speed multiplier (relative to starting speed)
-						local speedMultiplier = data.currentSpeed / FORWARD_SPEED
-
-						-- Send speed update to client
-						speedUpdateEvent:FireClient(player, speedMultiplier)
-						rainbowUIEvent:FireClient(player)
-						print(player.Name .. " passed through rainbow gate! Speed boosted to " .. data.currentSpeed .. " (" .. string.format("%.2f", speedMultiplier) .. "x)")
-					end
-				end)
-
-			else
-				warn("RainbowGate model has no BasePart; cannot position it.")
-				gate.Parent = model
-			end
-		else
-			warn("RainbowGate not found in ServerStorage; skipping gate placement for segment", index)
-		end
-	end
-
-	model.Parent = Workspace
- return model
-end
--- build initial 8 segments
-local function buildInitialTrack()
-	segments = {}
-	for i = 0, SEGMENTS_AHEAD - 1 do
-		local seg = createSegment(i)
-		table.insert(segments, seg)
-	end
-	lastIndexSpawned = SEGMENTS_AHEAD - 1
-end
-
-buildInitialTrack()
-
--- place player on first segment when they spawn
-local function placeOnTrack(player, character)
-	if #segments == 0 then return end
-	local firstSeg = segments[1]
-	if not firstSeg.PrimaryPart then return end
-
-	local rootPart = getRootPart(character)
-	if rootPart then
-		local pos = firstSeg.PrimaryPart.Position
-		-- stand on it and look forward (toward -Z)
-		rootPart.CFrame = CFrame.new(pos + Vector3.new(0, 5, 5), pos + Vector3.new(0, 5, -200))
-	end
-end
-
-Players.PlayerAdded:Connect(function(player)
-	player.CharacterAdded:Connect(function(char)
-		task.wait(0.2)
-		if #segments == 0 then
-			buildInitialTrack()
-		end
-		placeOnTrack(player, char)
-		setupCharacterMovement(player, char)
-	end)
-end)
-
--- client asks: "I passed a segment, give me a new one"
-advanceEvent.OnServerEvent:Connect(function(player)
-	-- remove oldest
-	local firstSeg = segments[1]
-	if firstSeg then
-		firstSeg:Destroy()
-		table.remove(segments, 1)
-	end
-
-	-- create a new one farther
-	lastIndexSpawned += 1
-	local newSeg = createSegment(lastIndexSpawned)
-	table.insert(segments, newSeg)
-end)
-
--- still keep fall-to-death
-RunService.Heartbeat:Connect(function(deltaTime)
-	for _, player in ipairs(Players:GetPlayers()) do
-		 local data = playerData[player]
-        if not data then continue end
-
-        local rootPart = data.rootPart
-        local hum = data.humanoid
-        if rootPart and hum then
-            -- Fall to death
-            if rootPart.Position.Y < (START_Y - 10) then
-                hum.Health = 0
+-- Obstacle pattern generator
+local function genObstaclePattern(diff, runDist)
+    local s     = DIFFICULTY[diff] or DIFFICULTY.normal
+    local dFact = math.min(runDist / 1500, 1.0)
+    local numObs
+    if diff == "easy" then
+        numObs = 1
+    elseif diff == "impossible" then
+        numObs = math.min(5, s.obstaclesPerRow + math.floor(dFact * 2))
+    else
+        numObs = math.min(NUM_LANES - 1, s.obstaclesPerRow + math.floor(dFact * 1.5))
+    end
+    local clusterProb = s.clusterChance + dFact * 0.15
+    local lanes = { false, false, false, false, false }
+    if numObs > 0 and math.random() < clusterProb then
+        local maxStart = math.max(1, NUM_LANES - numObs + 1)
+        local start    = math.random(1, maxStart)
+        for i = 0, numObs - 1 do lanes[start + i] = true end
+    else
+        local placed, tries = 0, 0
+        while placed < numObs and tries < 30 do
+            local lane = math.random(1, NUM_LANES)
+            if not lanes[lane] then
+                lanes[lane] = true
+                placed      = placed + 1
             end
+            tries = tries + 1
+        end
+    end
+    -- Guarantee at least one safe lane for all difficulties EXCEPT:
+    -- "impossible" past 600 m, where full 5-lane blockage is intentional.
+    -- Players must use the "phase" or "invincibility" ability to survive these.
+    if not (diff == "impossible" and runDist > 600) then
+        local safe = 0
+        for _, v in ipairs(lanes) do if not v then safe = safe + 1 end end
+        if safe == 0 then lanes[math.random(1, NUM_LANES)] = false end
+    end
+    return lanes
+end
 
-            -- Increment distance (Z decreases, so subtract)
-            local dz = -data.linearVel.VectorVelocity.Z * deltaTime
-            data.distanceTravelled += dz
+local function pickObsType(runDist)
+    if runDist < 100 then return "solid_barrier", OBS_DEFS.solid_barrier end
+    return pickWeighted(OBS_DEFS, OBS_TOTAL_W)
+end
 
-            -- Check milestones (every 100 meters)
-            local milestone = math.floor(data.distanceTravelled / 100)
-            if milestone > data.milestoneIndex then
-                data.milestoneIndex = milestone
-                -- Fire client UI event
-                local message = ""
-                if milestone == 1 then
-                    message = "100 meters! You did it!"
-                elseif milestone == 2 then
-                    message = "200 meters! You are god!"
-                else
-                    message = milestone * 100 .. " meters!"
+-- Segment creator
+local function createSegment(idx, diff, runDist)
+    diff    = diff    or "normal"
+    runDist = runDist or 0
+    local model  = Instance.new("Model")
+    model.Name   = "Segment_" .. idx
+    local biome  = getBiome(runDist)
+    local segZ   = -(idx * SEGMENT_LENGTH)
+
+    -- Floor
+    local floor = makePart(Vector3.new(SEGMENT_WIDTH, FLOOR_THICK, SEGMENT_LENGTH),
+                            biome.floorBC, true, true)
+    floor.Name   = "Floor"
+    floor.CFrame = CFrame.new(0, FLOOR_Y, segZ)
+    floor.Parent = model
+    model.PrimaryPart = floor
+
+    -- Side walls (visual)
+    for _, side in ipairs({ -1, 1 }) do
+        local wall = makePart(Vector3.new(2, 10, SEGMENT_LENGTH), biome.wallBC, true, false)
+        wall.Transparency = 0.55
+        wall.Name         = "Wall"
+        wall.CFrame       = CFrame.new(side * (SEGMENT_WIDTH / 2 + 1), FLOOR_Y + 5, segZ)
+        wall.Parent       = model
+    end
+
+    -- Lane dividers (visual)
+    for i = 1, NUM_LANES - 1 do
+        local divX = LANE_X[i] + LANE_WIDTH / 2
+        local div  = makePart(Vector3.new(0.3, 0.15, SEGMENT_LENGTH),
+                               BrickColor.new("Institutional white"), true, false)
+        div.Transparency = 0.65
+        div.Name         = "LaneDivider"
+        div.CFrame       = CFrame.new(divX, FLOOR_Y + FLOOR_THICK / 2 + 0.07, segZ)
+        div.Parent       = model
+    end
+
+    -- Obstacle rows
+    if idx >= SAFE_ZONE_SEGS then
+        for row = 1, OBS_ROWS_PER_SEG do
+            local t    = row / (OBS_ROWS_PER_SEG + 1)
+            local rowZ = segZ + (t - 0.5) * SEGMENT_LENGTH
+            local pat  = genObstaclePattern(diff, runDist)
+            for laneIdx, hasObs in ipairs(pat) do
+                if not hasObs then continue end
+                local typeName, def = pickObsType(runDist)
+                local h    = def.h
+                local obsY = FLOOR_Y + FLOOR_THICK / 2 + h / 2
+                local obs  = makePart(Vector3.new(LANE_WIDTH - 0.8, h, 4),
+                                       def.color, true, not def.hazard)
+                obs.Name   = "Obstacle_" .. typeName
+                obs.CFrame = CFrame.new(LANE_X[laneIdx], obsY, rowZ)
+                if def.hazard then
+                    obs.Material  = Enum.Material.Neon
+                    obs.CanTouch  = true
                 end
-                ReplicatedStorage:WaitForChild("MilestoneUIEvent"):FireClient(player, message)
+                obs.Parent = model
+                if def.moving then
+                    table.insert(movObstacles, {
+                        part  = obs,
+                        minX  = LANE_X[math.max(1, laneIdx - 1)],
+                        maxX  = LANE_X[math.min(NUM_LANES, laneIdx + 1)],
+                        speed = 5,
+                        posX  = LANE_X[laneIdx],
+                        dir   = 1,
+                    })
+                end
+                obs.Touched:Connect(function(hit)
+                    local char = hit:FindFirstAncestorOfClass("Model")
+                    if not char then return end
+                    local plr = Players:GetPlayerFromCharacter(char)
+                    if not plr then return end
+                    local pd  = _G.playerRunData and _G.playerRunData[plr]
+                    if not pd or not pd.isAlive then return end
+                    if pd.isPhasing    then return end
+                    if pd.isInvincible then return end
+                    -- high_barrier can be cleared by sliding under it
+                    -- low_barrier requires a jump (slide does NOT help here)
+                    if typeName == "high_barrier" and pd.isSliding then return end
+                    ObstacleHitEvt:FireClient(plr, typeName)
+                    pd.noHitBonus = false
+                    if pd.shields and pd.shields > 0 then
+                        pd.shields = pd.shields - 1
+                        ShieldUpdateEvt:FireClient(plr, pd.shields)
+                    elseif pd.health and pd.health > 1 then
+                        pd.health = pd.health - 1
+                        HealthUpdateEvt:FireClient(plr, pd.health, pd.maxHealth)
+                    else
+                        local hum = char:FindFirstChildOfClass("Humanoid")
+                        if hum then hum.Health = 0 end
+                    end
+                end)
             end
         end
-	end
+    end
+
+    -- Collectibles
+    for laneIdx = 1, NUM_LANES do
+        if math.random() > 0.40 then continue end
+        local typeName, def = pickWeighted(COL_DEFS, COL_TOTAL_W)
+        local t    = math.random() * 0.80 + 0.10
+        local colZ = segZ + (t - 0.5) * SEGMENT_LENGTH
+        local col  = makePart(Vector3.new(2, 2, 2), def.color, true, false)
+        col.Name     = "Collectible_" .. typeName
+        col.Shape    = Enum.PartType.Ball
+        col.Material = Enum.Material.Neon
+        col.CanTouch = true
+        col.CFrame   = CFrame.new(LANE_X[laneIdx], FLOOR_Y + FLOOR_THICK / 2 + 2, colZ)
+        col.Parent   = model
+        -- Tag currency collectibles for MagnetManager attraction
+        if def.coinVal then CollectionService:AddTag(col, "Cupcake") end
+        local grabbed = false
+        col.Touched:Connect(function(hit)
+            if grabbed then return end
+            local char = hit:FindFirstAncestorOfClass("Model")
+            if not char then return end
+            local plr  = Players:GetPlayerFromCharacter(char)
+            if not plr then return end
+            local pd   = _G.playerRunData and _G.playerRunData[plr]
+            if not pd or not pd.isAlive then return end
+            grabbed = true
+            col:Destroy()
+            if def.coinVal then
+                pd.score = pd.score + def.coinVal
+                if typeName == "energy_shard" then
+                    pd.energyShards = (pd.energyShards or 0) + 1
+                elseif typeName == "data_cube" then
+                    pd.dataCubes = (pd.dataCubes or 0) + 1
+                end
+                local ls = plr:FindFirstChild("leaderstats")
+                if ls and ls:FindFirstChild("Coins") then
+                    ls.Coins.Value = ls.Coins.Value + def.coinVal
+                end
+            elseif def.speedBoost then
+                local boost = def.speedBoost
+                pd.speedBoost = (pd.speedBoost or 0) + boost
+                SpeedUpdateEvt:FireClient(plr, (pd.currentSpeed + pd.speedBoost) / BASE_FORWARD_SPEED)
+                task.delay(def.boostDur or 5, function()
+                    if _G.playerRunData[plr] == pd then
+                        pd.speedBoost = math.max(0, pd.speedBoost - boost)
+                    end
+                end)
+            elseif def.abilCharge then
+                pd.abilityCharges = math.min(
+                    (pd.abilityCharges or 0) + 1, pd.maxAbilCharges or 3)
+                AbilityUpdateEvt:FireClient(plr, pd.abilityCharges)
+            elseif def.shield then
+                pd.shields = math.min((pd.shields or 0) + 1, 3)
+                ShieldUpdateEvt:FireClient(plr, pd.shields)
+            end
+        end)
+    end
+
+    model.Parent = Workspace
+    return model
+end
+
+-- Track management
+local function buildTrack(diff)
+    for _, seg in ipairs(segments) do
+        if seg and seg.Parent then seg:Destroy() end
+    end
+    segments     = {}
+    nextSegIdx   = 0
+    movObstacles = {}
+    for i = 0, SEGMENTS_AHEAD - 1 do
+        table.insert(segments, createSegment(i, diff, 0))
+    end
+    nextSegIdx = SEGMENTS_AHEAD
+end
+
+local function addNextSeg(diff, runDist)
+    local seg = createSegment(nextSegIdx, diff or "normal", runDist or 0)
+    table.insert(segments, seg)
+    nextSegIdx = nextSegIdx + 1
+    if #segments > SEGMENTS_AHEAD + 5 then
+        local old = table.remove(segments, 1)
+        if old and old.Parent then old:Destroy() end
+    end
+end
+
+-- Leaderstats
+local function ensureLeaderstats(player)
+    local ls = player:WaitForChild("leaderstats", 5)
+    if not ls then
+        ls = Instance.new("Folder"); ls.Name = "leaderstats"; ls.Parent = player
+    end
+    local function addVal(name, cls, def)
+        if not ls:FindFirstChild(name) then
+            local v = Instance.new(cls); v.Name = name; v.Value = def; v.Parent = ls
+        end
+    end
+    addVal("Score",    "IntValue", 0)
+    addVal("Distance", "IntValue", 0)
+    addVal("Coins",    "IntValue", 0)
+end
+
+-- Character setup
+local function setupCharacter(player, char, pd)
+    task.wait(0.6)
+    local root = getRootPart(char)
+    local hum  = char:FindFirstChildOfClass("Humanoid")
+    if not root or not hum then
+        warn("[runner] no root/humanoid for", player.Name); return
+    end
+    pd.rootPart = root
+    pd.humanoid = hum
+    root.CFrame = CFrame.new(LANE_X[3], FLOOR_Y + FLOOR_THICK + 5, 15)
+    for _, n in ipairs({ "RunnerAtt", "RunnerVel", "RunnerGyro" }) do
+        local e = root:FindFirstChild(n); if e then e:Destroy() end
+    end
+    local att = Instance.new("Attachment")
+    att.Name  = "RunnerAtt"
+    att.Parent = root
+    local lv                  = Instance.new("LinearVelocity")
+    lv.Name                   = "RunnerVel"
+    lv.Attachment0            = att
+    lv.RelativeTo             = Enum.ActuatorRelativeTo.World
+    lv.MaxForce               = 150000
+    lv.VectorVelocity         = Vector3.new(0, 0, -pd.currentSpeed)
+    lv.Parent                 = root
+    local ao            = Instance.new("AlignOrientation")
+    ao.Name             = "RunnerGyro"
+    ao.Attachment0      = att
+    ao.Mode             = Enum.OrientationAlignmentMode.OneAttachment
+    ao.MaxTorque        = 300000
+    ao.Responsiveness   = 200
+    ao.CFrame           = CFrame.Angles(0, 0, 0)
+    ao.Parent           = root
+    hum.AutoRotate      = false
+    pd.linearVelocity   = lv
+    pd.propAtt          = att
+    SpeedUpdateEvt:FireClient(player, pd.currentSpeed / BASE_FORWARD_SPEED)
+    HealthUpdateEvt:FireClient(player, pd.health, pd.maxHealth)
+    ShieldUpdateEvt:FireClient(player, pd.shields)
+    AbilityUpdateEvt:FireClient(player, pd.abilityCharges)
+    RunStartEvt:FireClient(player, pd.difficulty)
+end
+
+-- Run end
+local function endRun(player, pd)
+    if pd.runEnded then return end
+    pd.runEnded = true
+    pd.isAlive  = false
+    local s           = DIFFICULTY[pd.difficulty] or DIFFICULTY.normal
+    local persist     = getPersist(player)
+    local runTime     = os.clock() - pd.runStartTime
+    local rawScore    = math.floor(pd.distanceTraveled) + pd.score * 2
+    local noHitBonus  = pd.noHitBonus and math.floor(runTime * 5) or 0
+    local scoreMult   = 1 + 0.15 * (persist.upgrades.score_mult or 0)
+    local finalScore  = math.floor((rawScore * s.speedMult + noHitBonus) * scoreMult)
+    local currencyEarned = pd.energyShards + pd.dataCubes * 5
+    persist.currency = persist.currency + currencyEarned
+    local ls = player:FindFirstChild("leaderstats")
+    if ls then
+        if ls:FindFirstChild("Score")    then ls.Score.Value    = math.max(ls.Score.Value, finalScore) end
+        if ls:FindFirstChild("Distance") then ls.Distance.Value = math.floor(pd.distanceTraveled) end
+    end
+    RunEndEvt:FireClient(player, {
+        distance      = math.floor(pd.distanceTraveled),
+        score         = finalScore,
+        coins         = pd.energyShards,
+        dataCubes     = pd.dataCubes,
+        difficulty    = pd.difficulty,
+        timeSurvived  = math.floor(runTime),
+        noHitBonus    = noHitBonus,
+        totalCurrency = persist.currency,
+    })
+    CurrencyUpdateEvt:FireClient(player, persist.currency)
+end
+
+-- Players
+Players.PlayerAdded:Connect(function(player)
+    ensureLeaderstats(player)
+    getPersist(player)
+    local pd = initRun(player, "normal")
+    player.CharacterAdded:Connect(function(char)
+        local diff = (_G.playerRunData[player] and _G.playerRunData[player].difficulty) or "normal"
+        pd = initRun(player, diff)
+        if #segments == 0 then buildTrack(diff) end
+        setupCharacter(player, char, pd)
+    end)
 end)
+
+Players.PlayerRemoving:Connect(function(player)
+    _G.playerRunData[player] = nil
+end)
+
+-- Remote Handlers
+LaneSwitchEvt.OnServerEvent:Connect(function(player, newLane)
+    local pd = _G.playerRunData[player]
+    if not pd or not pd.isAlive then return end
+    newLane = math.clamp(math.floor(tonumber(newLane) or 3), 1, NUM_LANES)
+    pd.laneIndex = newLane
+    local root = pd.rootPart
+    if root and root.Parent then
+        root.CFrame = CFrame.new(LANE_X[newLane], root.Position.Y, root.Position.Z)
+    end
+end)
+
+PlayerJumpEvt.OnServerEvent:Connect(function(player)
+    local pd = _G.playerRunData[player]
+    if not pd or not pd.isAlive then return end
+    local hum = pd.humanoid
+    if hum and hum.Parent then hum.Jump = true end
+end)
+
+PlayerSlideEvt.OnServerEvent:Connect(function(player)
+    local pd = _G.playerRunData[player]
+    if not pd or not pd.isAlive or pd.isSliding then return end
+    pd.isSliding = true
+    task.delay(0.8, function()
+        if _G.playerRunData[player] == pd then pd.isSliding = false end
+    end)
+end)
+
+UseAbilityEvt.OnServerEvent:Connect(function(player, abilityName)
+    local pd = _G.playerRunData[player]
+    if not pd or not pd.isAlive then return end
+    if not ABILITY_CD[abilityName] then return end
+    if (pd.abilityCharges or 0) <= 0 then return end
+    local persist = getPersist(player)
+    local cdRedLv = persist.upgrades.ability_cd or 0
+    local cd      = ABILITY_CD[abilityName] * (1 - 0.15 * cdRedLv)
+    local now     = os.clock()
+    pd.abilityCooldown = pd.abilityCooldown or {}
+    if pd.abilityCooldown[abilityName] and now < pd.abilityCooldown[abilityName] then return end
+    pd.abilityCooldown[abilityName] = now + cd
+    pd.abilityCharges = pd.abilityCharges - 1
+    AbilityUpdateEvt:FireClient(player, pd.abilityCharges)
+    AbilityCDEvt:FireClient(player, abilityName, cd)
+    if abilityName == "phase" then
+        pd.isPhasing = true
+        task.delay(2, function()
+            if _G.playerRunData[player] == pd then pd.isPhasing = false end
+        end)
+    elseif abilityName == "invincibility" then
+        pd.isInvincible = true
+        task.delay(3, function()
+            if _G.playerRunData[player] == pd then pd.isInvincible = false end
+        end)
+    elseif abilityName == "dash" then
+        local root = pd.rootPart
+        if root and root.Parent then
+            local newLane = math.clamp(pd.laneIndex + 2, 1, NUM_LANES)
+            pd.laneIndex  = newLane
+            root.CFrame   = CFrame.new(LANE_X[newLane], root.Position.Y, root.Position.Z)
+        end
+    elseif abilityName == "timeslow" then
+        local origSpeed = pd.currentSpeed
+        pd.currentSpeed = origSpeed * 0.35
+        if pd.linearVelocity and pd.linearVelocity.Parent then
+            pd.linearVelocity.VectorVelocity = Vector3.new(0, 0, -pd.currentSpeed)
+        end
+        SpeedUpdateEvt:FireClient(player, pd.currentSpeed / BASE_FORWARD_SPEED)
+        task.delay(4, function()
+            if _G.playerRunData[player] == pd and pd.isAlive then
+                pd.currentSpeed = origSpeed
+                if pd.linearVelocity and pd.linearVelocity.Parent then
+                    pd.linearVelocity.VectorVelocity = Vector3.new(0, 0, -pd.currentSpeed)
+                end
+                SpeedUpdateEvt:FireClient(player, pd.currentSpeed / BASE_FORWARD_SPEED)
+            end
+        end)
+    end
+end)
+
+SelectDiffEvt.OnServerEvent:Connect(function(player, diff)
+    if not DIFFICULTY[diff] then return end
+    local pd = _G.playerRunData[player]
+    if pd then pd.difficulty = diff end
+    print("[runner]", player.Name, "selected:", diff)
+end)
+
+RequestRunEvt.OnServerEvent:Connect(function(player)
+    local diff = (_G.playerRunData[player] and _G.playerRunData[player].difficulty) or "normal"
+    buildTrack(diff)
+    initRun(player, diff)
+    player:LoadCharacter()
+end)
+
+RunnerAdvanceEvt.OnServerEvent:Connect(function(player)
+    local pd   = _G.playerRunData[player]
+    local diff = (pd and pd.difficulty) or "normal"
+    local dist = (pd and pd.distanceTraveled) or 0
+    addNextSeg(diff, dist)
+end)
+
+-- Upgrade purchase (minimal guard; ProgressionHub.server.lua handles it fully)
+BuyUpgradeEvt.OnServerEvent:Connect(function() end)
+
+-- Heartbeat
+local lastHB = os.clock()
+RunService.Heartbeat:Connect(function()
+    local now = os.clock()
+    local dt  = math.min(now - lastHB, 0.1)
+    lastHB    = now
+
+    -- Moving obstacles oscillation
+    for i = #movObstacles, 1, -1 do
+        local mo = movObstacles[i]
+        if not mo.part or not mo.part.Parent then
+            table.remove(movObstacles, i)
+            continue
+        end
+        mo.posX = mo.posX + mo.speed * mo.dir * dt
+        if mo.posX >= mo.maxX then mo.posX = mo.maxX; mo.dir = -1 end
+        if mo.posX <= mo.minX then mo.posX = mo.minX; mo.dir =  1 end
+        local cf = mo.part.CFrame
+        mo.part.CFrame = CFrame.new(mo.posX, cf.Y, cf.Z)
+    end
+
+    for player, pd in pairs(_G.playerRunData) do
+        if not pd.isAlive or pd.runEnded then continue end
+        local char = player.Character
+        if not char then continue end
+        local root = pd.rootPart
+        local hum  = pd.humanoid
+        if not root or not root.Parent or not hum then continue end
+
+        if hum.Health <= 0 then
+            endRun(player, pd)
+            continue
+        end
+
+        -- Fall off track
+        if root.Position.Y < FLOOR_Y - 20 then
+            hum.Health = 0
+            endRun(player, pd)
+            continue
+        end
+
+        -- Exit track sides
+        if math.abs(root.Position.X) > SEGMENT_WIDTH / 2 + 5 then
+            hum.Health = 0
+            endRun(player, pd)
+            continue
+        end
+
+        -- Speed ramp
+        if now - pd.lastRampTime >= SPEED_RAMP_INTERVAL then
+            pd.lastRampTime = now
+            local s = DIFFICULTY[pd.difficulty] or DIFFICULTY.normal
+            pd.currentSpeed = math.min(pd.currentSpeed + SPEED_RAMP * s.speedMult, MAX_SPEED)
+        end
+
+        -- Apply velocity
+        if pd.linearVelocity and pd.linearVelocity.Parent then
+            local spd = pd.currentSpeed + (pd.speedBoost or 0)
+            pd.linearVelocity.VectorVelocity = Vector3.new(0, 0, -spd)
+        end
+
+        -- Distance tracking
+        pd.distanceTraveled = pd.distanceTraveled + (pd.currentSpeed + (pd.speedBoost or 0)) * dt
+        local ls = player:FindFirstChild("leaderstats")
+        if ls and ls:FindFirstChild("Distance") then
+            ls.Distance.Value = math.floor(pd.distanceTraveled)
+        end
+
+        -- Milestones
+        local ms = math.floor(pd.distanceTraveled / 100)
+        if ms > pd.lastMilestone then
+            pd.lastMilestone = ms
+            MilestoneEvt:FireClient(player, ms * 100)
+            pd.currentSpeed  = math.min(pd.currentSpeed + MILESTONE_SPEED_BONUS, MAX_SPEED)
+            SpeedUpdateEvt:FireClient(player, (pd.currentSpeed + (pd.speedBoost or 0)) / BASE_FORWARD_SPEED)
+            BiomeChangeEvt:FireClient(player, getBiome(pd.distanceTraveled).name)
+        end
+
+        -- Auto-extend track
+        if #segments > 0 then
+            local last = segments[#segments]
+            if last and last.PrimaryPart then
+                if (root.Position.Z - (last.PrimaryPart.Position.Z - SEGMENT_LENGTH / 2)) < SEGMENT_LENGTH * 3 then
+                    addNextSeg(pd.difficulty, pd.distanceTraveled)
+                end
+            end
+        end
+    end
+end)
+
+-- Initial track build
+buildTrack("normal")
+print("[runner] 5-lane endless runner initialised.")
