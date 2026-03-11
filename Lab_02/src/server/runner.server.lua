@@ -1,445 +1,540 @@
--- runner.server.lua
--- Free-steering endless runner with curved track generation.
--- Requirements:
---   * No lane mechanics (LaneSwitch / laneIndex / LANE_X removed)
---   * Player steers with A/D via RunnerSteer RemoteEvent (TurnAxis in [-1,1])
---   * Server rotates character heading and drives LinearVelocity = LookVector * speed
---   * Track generated with a trackCFrame cursor; shapes I/C/S/L with weighted probabilities
---   * Segment advance driven by distanceTravelled (no Z-only assumptions)
---   * Obstacles & cupcakes spawned at random lateral offsets relative to segment CFrame
+--[[
+  runner.server.lua
+  Free-steering endless runner — server authority.
 
-local Players        = game:GetService("Players")
-local RunService     = game:GetService("RunService")
+  Track generation
+  ─────────────────
+  Segments are generated procedurally along a running CFrame (position +
+  orientation).  Each new segment appends to the end of the last, so the
+  track curves seamlessly in world space.
+
+  Segment type weights (must sum to 100):
+    I  = 92 %  (straight; includes the unspecified 2 % allocated to I)
+    C  =  3 %  (45° gentle curve, random L/R)
+    S  =  3 %  (S-curve: 45° one way then 45° back, random initial dir)
+    L  =  2 %  (90° corner, random L/R)
+
+  Player control
+  ─────────────────
+  The client sends a TurnInput event with axis ∈ [-1, 1].
+  The server applies incremental yaw to the character root every Heartbeat
+  and keeps the LinearVelocity aligned with the character's LookVector so
+  the player always runs in the direction they face.
+
+  Lane system removed: no LANE_X, no LaneSwitch remote.
+--]]
+
+local Players         = game:GetService("Players")
+local RunService      = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local ServerStorage  = game:GetService("ServerStorage")
+local CollectionService = game:GetService("CollectionService")
 
--- ── Constants ─────────────────────────────────────────────────────────────────
-local FORWARD_SPEED       = 30      -- studs/s starting forward speed
-local MAX_SPEED           = 120     -- studs/s cap
-local SPEED_RAMP_RATE     = 0.04    -- studs/s gained per second
-local TURN_RATE           = math.rad(80) -- max yaw rate (radians/s)
+-- ── Constants ──────────────────────────────────────────────────────────────
+local FORWARD_SPEED    = 30      -- studs / s  (base propulsion)
+local SPEED_RAMP       = 0.5     -- studs / s  added every ramp interval
+local SPEED_RAMP_INTERVAL = 8    -- seconds between speed ramps
+local TURN_SPEED_DEG   = 90      -- degrees / s max yaw rate
+local TURN_RATE_LIMIT  = 0.05    -- min seconds between TurnInput applications
 
-local SEGMENT_LENGTH      = 80      -- studs, length budget per segment
-local SEGMENT_WIDTH       = 30      -- studs, track width
-local FLOOR_THICKNESS     = 2       -- studs
-local FLOOR_Y             = 2       -- world Y for floor center
--- R15 HumanoidRootPart is ~2.5 studs above the character's feet.
--- Floor top = FLOOR_Y + FLOOR_THICKNESS/2 = 3.  Correct HRP spawn = 3 + 2.5 = 5.5.
-local PLAYER_SPAWN_Y      = FLOOR_Y + FLOOR_THICKNESS / 2 + 2.5
+local FLOOR_WIDTH      = 20      -- studs — track width
+local FLOOR_THICK      = 2       -- studs — floor thickness
+local STRAIGHT_LEN     = 60      -- studs — I-segment length
 
-local SUB_PIECES          = 8       -- sub-parts per curved segment
-local CURVE_C_ANGLE       = math.rad(45)   -- total bend for C shape
-local CURVE_S_HALF_ANGLE  = math.rad(30)   -- half-bend for each arm of S shape
-local CURVE_L_ANGLE       = math.rad(90)   -- total bend for L shape (corner)
+-- Curve parameters
+local ARC_RADIUS       = 50      -- studs — radius for C / S / L curves
+local ARC_PIECES_C     = 8       -- sub-pieces for a 45° C segment
+local ARC_PIECES_L     = 16      -- sub-pieces for a 90° L segment
 
-local SAFE_ZONE_SEGMENTS  = 3       -- first N segments are obstacle-free
-local LOOKAHEAD_SEGMENTS  = 6       -- spawn up to this many segments ahead
-local TOTAL_SEGMENTS_KEPT = 10      -- delete oldest segment beyond this count
+local SEGMENTS_AHEAD   = 10      -- keep this many segments generated ahead
+local CLEANUP_BEHIND   = 4       -- remove segments this far behind the oldest active one
 
-local OBSTACLE_MARGIN     = 4       -- lateral safety margin from edge (studs)
-local OBSTACLE_H          = 4       -- obstacle height (studs)
-local OBSTACLE_CHANCE     = 0.55    -- probability per eligible segment
-local CUPCAKE_CHANCE      = 0.45    -- probability per eligible segment
+-- ── Segment weights ────────────────────────────────────────────────────────
+-- I = 92% (the spec sums to 98%; the remaining 2% is allocated to I here)
+local SEG_TYPES   = { "I", "C", "S", "L" }
+local SEG_WEIGHTS = { 92,   3,   3,   2  }  -- must sum to 100
+local SEG_WEIGHT_TOTAL = 100
 
--- Weighted segment shapes (weights must sum to 100)
-local SHAPE_WEIGHTS = {
-    { shape = "I", cumulative = 92  },
-    { shape = "C", cumulative = 95  },
-    { shape = "S", cumulative = 98  },
-    { shape = "L", cumulative = 100 },
-}
-
--- ── Remote / Bindable events ──────────────────────────────────────────────────
-local function ensureInstance(parent, class, name)
-    local obj = parent:FindFirstChild(name)
-    if not obj then
-        obj = Instance.new(class)
-        obj.Name = name
-        obj.Parent = parent
-    end
-    return obj
+-- ── Remote events ──────────────────────────────────────────────────────────
+local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
+if not Remotes then
+    Remotes = Instance.new("Folder")
+    Remotes.Name   = "Remotes"
+    Remotes.Parent = ReplicatedStorage
 end
 
-local Remotes          = ensureInstance(ReplicatedStorage, "Folder",        "RunnerRemotes")
-local RunnerSteer      = ensureInstance(Remotes,           "RemoteEvent",   "RunnerSteer")
-local MilestoneUIEvent = ensureInstance(Remotes,           "RemoteEvent",   "MilestoneUIEvent")
-local SpeedUpdate      = ensureInstance(Remotes,           "RemoteEvent",   "SpeedUpdate")
--- MagnetStatus is used by MagnetManager.server.lua; create it here so the
--- client's WaitForChild resolves quickly regardless of script load order.
-ensureInstance(Remotes, "RemoteEvent", "MagnetStatus")
+local function getOrMake(name)
+    local e = Remotes:FindFirstChild(name)
+    if not e then
+        e        = Instance.new("RemoteEvent")
+        e.Name   = name
+        e.Parent = Remotes
+    end
+    return e
+end
 
--- BindableEvent for server-to-server communication with MagnetManager
-local SegmentCreated   = ensureInstance(ServerStorage,     "BindableEvent", "SegmentCreated")
+local RunnerAdvanceEvent = getOrMake("RunnerAdvance")
+local TurnInputEvent     = getOrMake("TurnInput")
+local SpeedUpdateEvent   = getOrMake("SpeedUpdate")
+local MilestoneUIEvent   = getOrMake("MilestoneUIEvent")
+-- MagnetStatus is created here so MagnetManager can find it
+getOrMake("MagnetStatus")
 
--- ── Shape picker ─────────────────────────────────────────────────────────────
-local function pickShape()
-    local roll = math.random(1, 100)
-    for _, entry in ipairs(SHAPE_WEIGHTS) do
-        if roll <= entry.cumulative then
-            return entry.shape
-        end
+-- ── Track state ────────────────────────────────────────────────────────────
+local trackFolder = Instance.new("Folder")
+trackFolder.Name   = "TrackSegments"
+trackFolder.Parent = workspace
+
+-- trackEndCF: the CFrame at the very end of the last generated segment.
+-- New segments are appended starting from this transform.
+local trackEndCF  = CFrame.new(0, 0, 0)
+local segmentList = {}   -- { index, segType, startCF, endCF, parts[] }
+local nextSegIndex = 0
+
+-- ── Weighted segment type picker ───────────────────────────────────────────
+local function pickSegmentType()
+    local r   = math.random(1, SEG_WEIGHT_TOTAL)
+    local cum = 0
+    for i, w in ipairs(SEG_WEIGHTS) do
+        cum = cum + w
+        if r <= cum then return SEG_TYPES[i] end
     end
     return "I"
 end
 
--- ── Floor part factory ────────────────────────────────────────────────────────
-local function makeFloorPart(cf, sizeX, sizeZ, parent)
+-- ── Floor piece builder ────────────────────────────────────────────────────
+-- startCF  — CFrame at the "entrance" face of the piece.
+-- The piece extends forward (−Z in local space) by sizeZ studs.
+-- Part centre is therefore at startCF * CFrame.new(0, −thick/2, −sizeZ/2).
+local function makeFloorPiece(startCF, sizeX, sizeZ, brickColor)
     local p = Instance.new("Part")
-    p.Name            = "TrackFloor"
-    p.Anchored        = true
-    p.CanCollide      = true
-    p.Material        = Enum.Material.SmoothPlastic
-    p.BrickColor      = BrickColor.new("Medium stone grey")
-    p.Size            = Vector3.new(sizeX, FLOOR_THICKNESS, sizeZ)
-    p.CFrame          = cf
-    p.Parent          = parent
+    p.Anchored    = true
+    p.CanCollide  = true
+    p.Size        = Vector3.new(sizeX, FLOOR_THICK, sizeZ)
+    p.Material    = Enum.Material.SmoothPlastic
+    p.BrickColor  = brickColor or BrickColor.new("Medium stone grey")
+    p.CFrame      = startCF * CFrame.new(0, -FLOOR_THICK / 2, -sizeZ / 2)
+    p.Parent      = trackFolder
     return p
 end
 
--- ── Segment builder ───────────────────────────────────────────────────────────
--- Returns (list_of_parts, newTrackCFrame)
--- newTrackCFrame is the cursor AFTER this segment so the next can seamlessly join.
-local function buildSegment(trackCFrame, shape, segFolder)
-    local parts   = {}
-    local subLen  = SEGMENT_LENGTH / SUB_PIECES
-    local cursor  = trackCFrame
+-- ── Straight segment (type I) ──────────────────────────────────────────────
+-- Returns (parts, exitCF)
+local function genStraight(startCF, length)
+    length = length or STRAIGHT_LEN
+    local part  = makeFloorPiece(startCF, FLOOR_WIDTH, length)
+    local exitCF = startCF * CFrame.new(0, 0, -length)
+    return { part }, exitCF
+end
 
-    if shape == "I" then
-        -- Single straight floor piece centred along the forward axis
-        local partCF = cursor * CFrame.new(0, 0, -SEGMENT_LENGTH / 2)
-        table.insert(parts, makeFloorPart(partCF, SEGMENT_WIDTH, SEGMENT_LENGTH, segFolder))
-        cursor = cursor * CFrame.new(0, 0, -SEGMENT_LENGTH)
+-- ── Arc segment helper ─────────────────────────────────────────────────────
+-- totalAngle: radians.  Positive = left turn (CCW from above); negative = right.
+-- Returns (parts, exitCF)
+local function genArc(startCF, totalAngle, numPieces)
+    local parts      = {}
+    local currentCF  = startCF
+    local pieceAngle = totalAngle / numPieces
+    -- chord length of each sub-piece along the arc
+    local chordLen   = 2 * ARC_RADIUS * math.sin(math.abs(pieceAngle) / 2)
 
-    elseif shape == "C" then
-        -- Gradual curve: SUB_PIECES sub-parts each turning curveAngle/SUB_PIECES
-        local dir       = math.random(0, 1) == 0 and 1 or -1
-        local angleEach = (CURVE_C_ANGLE * dir) / SUB_PIECES
-        for _ = 1, SUB_PIECES do
-            local partCF = cursor * CFrame.new(0, 0, -subLen / 2)
-            table.insert(parts, makeFloorPart(partCF, SEGMENT_WIDTH, subLen, segFolder))
-            cursor = cursor * CFrame.new(0, 0, -subLen) * CFrame.Angles(0, angleEach, 0)
+    for _ = 1, numPieces do
+        local part = makeFloorPiece(currentCF, FLOOR_WIDTH, chordLen)
+        table.insert(parts, part)
+        -- Advance forward by the chord, then rotate in-place by pieceAngle around Y
+        currentCF = currentCF * CFrame.new(0, 0, -chordLen) * CFrame.Angles(0, pieceAngle, 0)
+    end
+    return parts, currentCF
+end
+
+-- ── Full segment generator ─────────────────────────────────────────────────
+-- Returns (allParts, exitCF)
+local function generateSegment(segType, startCF)
+    local allParts = {}
+    local exitCF
+
+    if segType == "I" then
+        -- Straight
+        local p, cf = genStraight(startCF)
+        for _, v in ipairs(p) do table.insert(allParts, v) end
+        exitCF = cf
+
+    elseif segType == "C" then
+        -- Gentle curve: 45° to a random side
+        local dir = (math.random(0, 1) == 0) and 1 or -1
+        local p, cf = genArc(startCF, dir * math.rad(45), ARC_PIECES_C)
+        for _, v in ipairs(p) do table.insert(allParts, v) end
+        exitCF = cf
+
+    elseif segType == "S" then
+        -- S-curve: 45° one way then 45° back
+        local dir = (math.random(0, 1) == 0) and 1 or -1
+        local p1, midCF = genArc(startCF,  dir * math.rad(45), ARC_PIECES_C)
+        local p2, cf    = genArc(midCF,   -dir * math.rad(45), ARC_PIECES_C)
+        for _, v in ipairs(p1) do table.insert(allParts, v) end
+        for _, v in ipairs(p2) do table.insert(allParts, v) end
+        exitCF = cf
+
+    elseif segType == "L" then
+        -- Sharp corner: 90° to a random side
+        local dir = (math.random(0, 1) == 0) and 1 or -1
+        local p, cf = genArc(startCF, dir * math.rad(90), ARC_PIECES_L)
+        for _, v in ipairs(p) do table.insert(allParts, v) end
+        exitCF = cf
+    end
+
+    return allParts, exitCF
+end
+
+-- ── Collectible / obstacle spawning ───────────────────────────────────────
+-- Items are placed relative to the segment's local coordinate frame so
+-- they lie on top of the floor surface regardless of track orientation.
+local function spawnOnSegment(segData)
+    local sCF = segData.startCF
+    local eCF = segData.endCF
+
+    -- ── Cupcakes (tagged for magnet system) ──
+    local numCups = math.random(1, 3)
+    for _ = 1, numCups do
+        local tFwd = math.random()           -- 0–1 along segment
+        local xOff = (math.random() - 0.5) * (FLOOR_WIDTH - 4)
+
+        -- Interpolate CFrame along the segment and raise above floor
+        local worldCF = sCF:Lerp(eCF, tFwd) * CFrame.new(xOff, FLOOR_THICK + 1.5, 0)
+
+        local cup       = Instance.new("Part")
+        cup.Name        = "Cupcake"
+        cup.Shape       = Enum.PartType.Ball
+        cup.Size        = Vector3.new(2, 2, 2)
+        cup.BrickColor  = BrickColor.new("Bright pink")
+        cup.Material    = Enum.Material.Neon
+        cup.Anchored    = true
+        cup.CanCollide  = false
+        cup.CFrame      = worldCF
+        cup.Parent      = workspace
+
+        CollectionService:AddTag(cup, "Cupcake")
+
+        cup.Touched:Connect(function(hit)
+            local char   = hit.Parent
+            local player = Players:GetPlayerFromCharacter(char)
+            if player then
+                local ls = player:FindFirstChild("leaderstats")
+                if ls and ls:FindFirstChild("Score") then
+                    ls.Score.Value = ls.Score.Value + 1
+                end
+                -- Also increment Coins if present (from Leaderstats.server.lua)
+                if ls and ls:FindFirstChild("Coins") then
+                    ls.Coins.Value = ls.Coins.Value + 1
+                end
+                cup:Destroy()
+
+                -- Play pickup sound at the player's root part
+                local root = char:FindFirstChild("HumanoidRootPart")
+                if root then
+                    local snd       = Instance.new("Sound")
+                    snd.SoundId     = "rbxassetid://3124262382"
+                    snd.Volume      = 0.6
+                    snd.Parent      = root
+                    snd:Play()
+                    game:GetService("Debris"):AddItem(snd, 2)
+                end
+            end
+        end)
+    end
+
+    -- ── Magnet pickups (rare, ~1 per 5 segments) ──
+    if math.random(1, 5) == 1 then
+        local tFwd  = math.random() * 0.6 + 0.2
+        local xOff  = (math.random() - 0.5) * (FLOOR_WIDTH - 4)
+        local mCF   = sCF:Lerp(eCF, tFwd) * CFrame.new(xOff, FLOOR_THICK + 1.5, 0)
+
+        local mag       = Instance.new("Part")
+        mag.Name        = "Magnet"
+        mag.Shape       = Enum.PartType.Ball
+        mag.Size        = Vector3.new(2.5, 2.5, 2.5)
+        mag.BrickColor  = BrickColor.new("Bright yellow")
+        mag.Material    = Enum.Material.Neon
+        mag.Anchored    = true
+        mag.CanCollide  = false
+        mag.CFrame      = mCF
+        mag.Parent      = workspace
+
+        CollectionService:AddTag(mag, "MagnetPickup")
+    end
+
+    -- ── Obstacles (skip very first few segments) ──
+    if segData.index >= 3 then
+        local numObs = math.random(0, 2)
+        for _ = 1, numObs do
+            local tFwd = math.random() * 0.7 + 0.15
+            local xOff = (math.random() - 0.5) * (FLOOR_WIDTH - 6)
+            local worldCF = sCF:Lerp(eCF, tFwd) * CFrame.new(xOff, FLOOR_THICK + 2, 0)
+
+            local obs       = Instance.new("Part")
+            obs.Name        = "Obstacle"
+            obs.Size        = Vector3.new(4, 4, 4)
+            obs.BrickColor  = BrickColor.new("Bright red")
+            obs.Material    = Enum.Material.SmoothPlastic
+            obs.Anchored    = true
+            obs.CanCollide  = true
+            obs.CFrame      = worldCF
+            obs.Parent      = workspace
+
+            obs.Touched:Connect(function(hit)
+                local char = hit.Parent
+                if char and char:FindFirstChildOfClass("Humanoid") then
+                    char:FindFirstChildOfClass("Humanoid").Health = 0
+                end
+            end)
         end
+    end
+end
 
-    elseif shape == "S" then
-        -- S-curve: first half turns one way, second half turns back (net 0° change)
-        local dir       = math.random(0, 1) == 0 and 1 or -1
-        local halfPcs   = SUB_PIECES / 2
-        local angle1    = (CURVE_S_HALF_ANGLE *  dir) / halfPcs
-        local angle2    = (CURVE_S_HALF_ANGLE * -dir) / halfPcs
-        for i = 1, SUB_PIECES do
-            local partCF  = cursor * CFrame.new(0, 0, -subLen / 2)
-            table.insert(parts, makeFloorPart(partCF, SEGMENT_WIDTH, subLen, segFolder))
-            local ang     = (i <= halfPcs) and angle1 or angle2
-            cursor = cursor * CFrame.new(0, 0, -subLen) * CFrame.Angles(0, ang, 0)
-        end
+-- ── Add one segment to the track ──────────────────────────────────────────
+local function addSegment()
+    local segType = pickSegmentType()
+    local idx     = nextSegIndex
+    nextSegIndex  = nextSegIndex + 1
 
-    elseif shape == "L" then
-        -- 90° corner approximated with SUB_PIECES sub-parts
-        local dir       = math.random(0, 1) == 0 and 1 or -1
-        local angleEach = (CURVE_L_ANGLE * dir) / SUB_PIECES
-        for _ = 1, SUB_PIECES do
-            local partCF = cursor * CFrame.new(0, 0, -subLen / 2)
-            table.insert(parts, makeFloorPart(partCF, SEGMENT_WIDTH, subLen, segFolder))
-            cursor = cursor * CFrame.new(0, 0, -subLen) * CFrame.Angles(0, angleEach, 0)
+    local startCF              = trackEndCF
+    local parts, exitCF        = generateSegment(segType, startCF)
+    trackEndCF                 = exitCF
+
+    local segData = {
+        index   = idx,
+        segType = segType,
+        startCF = startCF,
+        endCF   = exitCF,
+        parts   = parts,
+    }
+    table.insert(segmentList, segData)
+    spawnOnSegment(segData)
+    return segData
+end
+
+-- ── Clean up old segments that are far behind all players ─────────────────
+local function cleanupOldSegments()
+    if #segmentList <= SEGMENTS_AHEAD + CLEANUP_BEHIND then return end
+
+    -- Find the minimum *logical* segment index that any player is near
+    local minActiveSeg = nextSegIndex  -- start high; reduce below
+    for _, p in ipairs(Players:GetPlayers()) do
+        local char = p.Character
+        if not char then continue end
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if not root then continue end
+        for _, seg in ipairs(segmentList) do
+            local d = (seg.startCF.Position - root.Position).Magnitude
+            if d < STRAIGHT_LEN * 2 then
+                -- segmentList is ordered by index, so the first segment within
+                -- range is the earliest one near the player. Record it and stop
+                -- scanning; we want the minimum index across all players.
+                if seg.index < minActiveSeg then minActiveSeg = seg.index end
+                break
+            end
         end
     end
 
-    return parts, cursor
+    -- Destroy segments whose logical index is more than CLEANUP_BEHIND behind
+    local removeBelow = minActiveSeg - CLEANUP_BEHIND
+    local newList     = {}
+    for _, seg in ipairs(segmentList) do
+        if seg.index < removeBelow then
+            for _, part in ipairs(seg.parts) do
+                if part and part.Parent then part:Destroy() end
+            end
+        else
+            table.insert(newList, seg)
+        end
+    end
+    segmentList = newList
 end
 
--- ── Obstacle spawning ─────────────────────────────────────────────────────────
-local function spawnObstacle(segCFrame, segFolder)
-    local halfW    = SEGMENT_WIDTH / 2 - OBSTACLE_MARGIN
-    local xOffset  = math.random() * halfW * 2 - halfW
-    -- Place somewhere in the middle two-thirds of the segment (not at the very ends)
-    local zOffset  = -(math.random() * SEGMENT_LENGTH * 0.6 + SEGMENT_LENGTH * 0.2)
-    local yOffset  = FLOOR_THICKNESS / 2 + OBSTACLE_H / 2
-
-    local worldCF  = segCFrame * CFrame.new(xOffset, yOffset, zOffset)
-
-    local obs      = Instance.new("Part")
-    obs.Name       = "Obstacle"
-    obs.Size       = Vector3.new(4, OBSTACLE_H, 4)
-    obs.BrickColor = BrickColor.new("Bright red")
-    obs.Material   = Enum.Material.Neon
-    obs.Anchored   = true
-    obs.CFrame     = worldCF
-    obs.Parent     = segFolder
-
-    obs.Touched:Connect(function(hit)
-        local char   = hit.Parent
-        local player = Players:GetPlayerFromCharacter(char)
-        if not player then return end
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum and hum.Health > 0 then
-            hum.Health = 0
-        end
-    end)
+-- ── Initial track ─────────────────────────────────────────────────────────
+for _ = 1, SEGMENTS_AHEAD do
+    addSegment()
 end
 
--- ── Cupcake spawning ──────────────────────────────────────────────────────────
-local function spawnCupcake(segCFrame, segFolder)
-    local halfW    = SEGMENT_WIDTH / 2 - OBSTACLE_MARGIN
-    local xOffset  = math.random() * halfW * 2 - halfW
-    local zOffset  = -(math.random() * SEGMENT_LENGTH * 0.7 + SEGMENT_LENGTH * 0.1)
-    local yOffset  = FLOOR_THICKNESS / 2 + 1.5
-
-    local worldCF  = segCFrame * CFrame.new(xOffset, yOffset, zOffset)
-
-    local cupcake       = Instance.new("Part")
-    cupcake.Name        = "Cupcake"
-    cupcake.Shape       = Enum.PartType.Ball
-    cupcake.Size        = Vector3.new(2.5, 2.5, 2.5)
-    cupcake.BrickColor  = BrickColor.new("Hot pink")
-    cupcake.Material    = Enum.Material.Neon
-    cupcake.Anchored    = true
-    cupcake.CanCollide  = false
-    cupcake.CFrame      = worldCF
-    cupcake.Parent      = segFolder
-
-    local collected = false
-    cupcake.Touched:Connect(function(hit)
-        if collected then return end
-        local char   = hit.Parent
-        local player = Players:GetPlayerFromCharacter(char)
-        if not player then return end
-        collected    = true
-        cupcake:Destroy()
-
-        local stats  = player:FindFirstChild("leaderstats")
-        if stats then
-            local coins = stats:FindFirstChild("Coins")
-            if coins then coins.Value += 1 end
-        end
-
-        local rootPart = char:FindFirstChild("HumanoidRootPart")
-        if rootPart then
-            local snd        = Instance.new("Sound")
-            snd.SoundId      = "rbxassetid://3124262382"
-            snd.Volume       = 0.6
-            snd.Parent       = rootPart
-            snd:Play()
-            game:GetService("Debris"):AddItem(snd, 2)
-        end
-    end)
-end
-
--- ── Per-player state ──────────────────────────────────────────────────────────
+-- ── Player data ───────────────────────────────────────────────────────────
 local playerData = {}
 
-local function newPlayerData()
-    return {
-        running          = false,
-        heading          = 0,       -- current yaw in radians (0 = facing -Z)
-        turnAxis         = 0,       -- [-1, 1], from client
-        currentSpeed     = FORWARD_SPEED,
-        distanceTravelled= 0,
-        segmentCount     = 0,
-        nextSpawnDist    = 0,       -- distanceTravelled threshold for next segment
-        trackCFrame      = CFrame.new(0, FLOOR_Y, 0),
-        segments         = {},      -- {folder, segCFrame}
-        linearVelocity   = nil,
-        rootPart         = nil,
-        milestoneReached = {},
-        speedTimer       = 0,
-    }
+-- Leaderstats.server.lua (also in ServerScriptService) creates the
+-- "leaderstats" folder with a "Coins" IntValue.  We add "Score" and
+-- "Distance" to that existing folder rather than creating a duplicate.
+local function ensureLeaderstats(player)
+    -- Wait up to 5 seconds for Leaderstats.server.lua to create the folder.
+    local ls = player:FindFirstChild("leaderstats")
+        or player:WaitForChild("leaderstats", 5)
+    if not ls then
+        -- Fallback: create our own if the other script is absent.
+        ls        = Instance.new("Folder")
+        ls.Name   = "leaderstats"
+        ls.Parent = player
+    end
+
+    if not ls:FindFirstChild("Score") then
+        local score       = Instance.new("IntValue")
+        score.Name        = "Score"
+        score.Value       = 0
+        score.Parent      = ls
+    end
+
+    if not ls:FindFirstChild("Distance") then
+        local dist        = Instance.new("IntValue")
+        dist.Name         = "Distance"
+        dist.Value        = 0
+        dist.Parent       = ls
+    end
 end
 
--- ── Spawn one track segment ───────────────────────────────────────────────────
-local function spawnSegment(data, shape)
-    local idx        = data.segmentCount + 1
-    data.segmentCount = idx
-
-    local segFolder  = Instance.new("Folder")
-    segFolder.Name   = "Segment_" .. idx
-    segFolder.Parent = workspace
-
-    local startCFrame        = data.trackCFrame
-    local _, newTrackCFrame  = buildSegment(startCFrame, shape, segFolder)
-    data.trackCFrame         = newTrackCFrame
-
-    -- Spawn pickups only outside the safe zone
-    if idx > SAFE_ZONE_SEGMENTS then
-        if math.random() < OBSTACLE_CHANCE then
-            spawnObstacle(startCFrame, segFolder)
-        end
-        if math.random() < CUPCAKE_CHANCE then
-            spawnCupcake(startCFrame, segFolder)
-        end
-    end
-
-    table.insert(data.segments, { folder = segFolder, segCFrame = startCFrame })
-    data.nextSpawnDist = data.nextSpawnDist + SEGMENT_LENGTH
-
-    -- Notify MagnetManager (server-to-server BindableEvent)
-    SegmentCreated:Fire(segFolder, startCFrame)
-end
-
--- ── Start runner for a player ─────────────────────────────────────────────────
-local function startRunner(player, data)
-    local char     = player.Character
-    if not char then return end
-    local rootPart = char:FindFirstChild("HumanoidRootPart")
-    local humanoid = char:FindFirstChildOfClass("Humanoid")
-    if not rootPart or not humanoid then return end
-
-    -- Prevent default character movement
-    humanoid.WalkSpeed   = 0
-    humanoid.JumpPower   = 0
-    humanoid.AutoRotate  = false
-
-    -- Clean up any segments from a previous run before starting fresh
-    for _, seg in ipairs(data.segments) do
-        if seg.folder and seg.folder.Parent then
-            seg.folder:Destroy()
-        end
-    end
-
-    -- Set up LinearVelocity constraint for server-driven forward motion
-    local att    = Instance.new("Attachment")
-    att.Name     = "RunnerAtt"
-    att.Parent   = rootPart
-
-    local lv     = Instance.new("LinearVelocity")
-    lv.Name      = "RunnerVelocity"
-    lv.Attachment0              = att
-    lv.MaxForce                 = 1e6
-    lv.VelocityConstraintMode   = Enum.VelocityConstraintMode.Vector
-    lv.VectorVelocity           = Vector3.new(0, 0, -FORWARD_SPEED)
-    lv.Parent    = rootPart
-
-    -- Reset per-player state
-    data.running           = true
-    data.heading           = 0
-    data.turnAxis          = 0
-    data.currentSpeed      = FORWARD_SPEED
-    data.distanceTravelled = 0
-    data.segmentCount      = 0
-    data.nextSpawnDist     = 0
-    data.trackCFrame       = CFrame.new(0, FLOOR_Y, 0)
-    data.segments          = {}
-    data.milestoneReached  = {}
-    data.speedTimer        = 0
-    data.linearVelocity    = lv
-    data.rootPart          = rootPart
-
-    -- Teleport character above the track start
-    rootPart.CFrame = CFrame.new(0, PLAYER_SPAWN_Y, 0)
-
-    -- Pre-spawn initial lookahead segments
-    for i = 1, LOOKAHEAD_SEGMENTS do
-        local shape = (i <= SAFE_ZONE_SEGMENTS) and "I" or pickShape()
-        spawnSegment(data, shape)
-    end
-
-    -- Stop runner when character dies
-    humanoid.Died:Connect(function()
-        data.running = false
-        if lv.Parent   then lv:Destroy()  end
-        if att.Parent  then att:Destroy() end
-    end)
-end
-
--- ── Heartbeat: steering + physics + segment management ───────────────────────
-RunService.Heartbeat:Connect(function(dt)
-    for player, data in pairs(playerData) do
-        if not data.running then continue end
-
-        local rootPart = data.rootPart
-        if not (rootPart and rootPart.Parent) then continue end
-
-        -- 1. Update heading from turn input
-        if data.turnAxis ~= 0 then
-            data.heading = data.heading + TURN_RATE * data.turnAxis * dt
-        end
-
-        -- 2. Reconstruct flat CFrame from heading (keeps character upright)
-        local pos     = rootPart.CFrame.Position
-        local lookDir = Vector3.new(math.sin(data.heading), 0, -math.cos(data.heading))
-        -- CFrame.lookAt(eye, lookAt) makes the -Z axis (LookVector) face toward lookAt.
-        -- lookDir is always unit-length (sin²+cos²=1), so pos+lookDir is never equal to pos.
-        rootPart.CFrame = CFrame.lookAt(pos, pos + lookDir)
-
-        -- 3. Ramp speed
-        data.currentSpeed = math.min(
-            data.currentSpeed + SPEED_RAMP_RATE * dt,
-            MAX_SPEED
-        )
-
-        -- 4. Update LinearVelocity direction to follow character heading
-        local lv = data.linearVelocity
-        if lv and lv.Parent then
-            lv.VectorVelocity = lookDir * data.currentSpeed
-        end
-
-        -- 5. Integrate distance
-        data.distanceTravelled = data.distanceTravelled + data.currentSpeed * dt
-
-        -- 6. Spawn new segments when approaching the frontier
-        while data.distanceTravelled + SEGMENT_LENGTH * LOOKAHEAD_SEGMENTS
-              >= data.nextSpawnDist do
-            spawnSegment(data, pickShape())
-        end
-
-        -- 7. Despawn oldest segments beyond the keep limit
-        while #data.segments > TOTAL_SEGMENTS_KEPT do
-            local oldest = table.remove(data.segments, 1)
-            if oldest.folder and oldest.folder.Parent then
-                oldest.folder:Destroy()
-            end
-        end
-
-        -- 8. Milestone events
-        local dist = math.floor(data.distanceTravelled)
-        for _, milestone in ipairs({ 100, 250, 500, 1000, 2000, 5000 }) do
-            if dist >= milestone and not data.milestoneReached[milestone] then
-                data.milestoneReached[milestone] = true
-                MilestoneUIEvent:FireClient(player, milestone)
-            end
-        end
-
-        -- 9. Periodic speed update to client (~0.5 s intervals)
-        data.speedTimer = data.speedTimer + dt
-        if data.speedTimer >= 0.5 then
-            data.speedTimer = 0
-            SpeedUpdate:FireClient(player, data.currentSpeed / FORWARD_SPEED)
-        end
-    end
-end)
-
--- ── RunnerSteer handler ───────────────────────────────────────────────────────
--- Client sends TurnAxis in range [-1, 1].  Positive = turn right (D key).
-RunnerSteer.OnServerEvent:Connect(function(player, turnAxis)
-    local data = playerData[player]
-    if not data then return end
-    if type(turnAxis) ~= "number" then return end
-    data.turnAxis = math.clamp(turnAxis, -1, 1)
-end)
-
--- ── Player lifecycle ──────────────────────────────────────────────────────────
 Players.PlayerAdded:Connect(function(player)
-    local data = newPlayerData()
-    playerData[player] = data
+    ensureLeaderstats(player)
 
-    player.CharacterAdded:Connect(function()
-        task.wait(0.5)  -- allow character to fully load
-        startRunner(player, data)
+    playerData[player] = {
+        speed            = FORWARD_SPEED,
+        turnAxis         = 0,
+        currentYaw       = 0,          -- accumulated yaw in radians
+        distanceTraveled = 0,
+        lastMilestone    = 0,
+        lastRampTime     = os.clock(),
+        lastTurnTime     = 0,
+        linearVelocity   = nil,
+        propAtt          = nil,
+    }
+
+    player.CharacterAdded:Connect(function(character)
+        local data = playerData[player]
+        if not data then return end
+
+        -- Reset per-run state
+        data.currentYaw       = 0
+        data.distanceTraveled = 0
+        data.lastMilestone    = 0
+        data.speed            = FORWARD_SPEED
+        data.lastRampTime     = os.clock()
+
+        task.wait(1) -- allow character to fully load
+
+        local root = character:WaitForChild("HumanoidRootPart")
+        local hum  = character:WaitForChild("Humanoid")
+
+        -- Teleport to track start (raised above floor)
+        character:PivotTo(CFrame.new(0, FLOOR_THICK + 5, 0))
+        data.currentYaw = 0
+
+        -- Attachment for LinearVelocity
+        local att        = Instance.new("Attachment")
+        att.Name         = "PropulsionAtt"
+        att.Parent       = root
+
+        -- LinearVelocity pushes the character forward along its look vector.
+        -- VelocityConstraintMode = Line applies force only along LineDirection.
+        local lv                         = Instance.new("LinearVelocity")
+        lv.Attachment0                   = att
+        lv.MaxForce                      = 1e5
+        lv.VelocityConstraintMode        = Enum.VelocityConstraintMode.Line
+        lv.LineDirection                 = root.CFrame.LookVector
+        lv.LineVelocity                  = data.speed
+        lv.RelativeTo                    = Enum.ActuatorRelativeTo.World
+        lv.Parent                        = root
+
+        data.linearVelocity = lv
+        data.propAtt        = att
+
+        -- Disable Humanoid auto-rotation so the server controls yaw fully
+        hum.AutoRotate = false
     end)
-
-    if player.Character then
-        task.wait(0.5)
-        startRunner(player, data)
-    end
 end)
 
 Players.PlayerRemoving:Connect(function(player)
+    playerData[player] = nil
+end)
+
+-- ── TurnInput remote ──────────────────────────────────────────────────────
+-- Client fires this with axis ∈ [-1, 1] (A/Left = -1, D/Right = 1)
+TurnInputEvent.OnServerEvent:Connect(function(player, axis)
     local data = playerData[player]
-    if data then
-        for _, seg in ipairs(data.segments) do
-            if seg.folder and seg.folder.Parent then
-                seg.folder:Destroy()
+    if not data then return end
+
+    -- Rate-limit processing
+    local now = os.clock()
+    if now - data.lastTurnTime < TURN_RATE_LIMIT then return end
+    data.lastTurnTime = now
+
+    data.turnAxis = math.clamp(tonumber(axis) or 0, -1, 1)
+end)
+
+-- ── RunnerAdvance: client requests more track ─────────────────────────────
+RunnerAdvanceEvent.OnServerEvent:Connect(function(_player)
+    addSegment()
+    cleanupOldSegments()
+end)
+
+-- ── Heartbeat: physics, turning, speed ramp, milestones ───────────────────
+local lastHeartbeat = os.clock()
+
+RunService.Heartbeat:Connect(function()
+    local now = os.clock()
+    local dt  = math.min(now - lastHeartbeat, 0.1) -- cap dt to avoid spiral
+    lastHeartbeat = now
+
+    for player, data in pairs(playerData) do
+        local character = player.Character
+        if not character then continue end
+
+        local root = character:FindFirstChild("HumanoidRootPart")
+        local hum  = character:FindFirstChildOfClass("Humanoid")
+        if not root or not hum or hum.Health <= 0 then continue end
+
+        -- ── Speed ramp ──
+        if now - data.lastRampTime >= SPEED_RAMP_INTERVAL then
+            data.lastRampTime = now
+            data.speed        = data.speed + SPEED_RAMP
+            SpeedUpdateEvent:FireClient(player, data.speed)
+        end
+
+        -- ── Yaw / steering ──
+        if math.abs(data.turnAxis) > 0.01 then
+            data.currentYaw = data.currentYaw
+                + math.rad(TURN_SPEED_DEG) * data.turnAxis * dt
+        end
+
+        -- Apply yaw: preserve position, update orientation around world Y
+        local pos    = root.Position
+        local newRot = CFrame.fromEulerAnglesYXZ(0, data.currentYaw, 0)
+        root.CFrame  = CFrame.new(pos) * newRot
+
+        -- ── Keep propulsion aligned with look vector ──
+        if data.linearVelocity and data.linearVelocity.Parent then
+            local look      = root.CFrame.LookVector
+            local horizFlat = Vector3.new(look.X, 0, look.Z)
+            -- Guard against zero vector (e.g. character looking straight up/down)
+            if horizFlat.Magnitude > 0.001 then
+                data.linearVelocity.LineDirection = horizFlat.Unit
             end
+            data.linearVelocity.LineVelocity = data.speed
+        end
+
+        -- ── Distance tracking ──
+        data.distanceTraveled = data.distanceTraveled + data.speed * dt
+
+        local ls = player:FindFirstChild("leaderstats")
+        if ls and ls:FindFirstChild("Distance") then
+            ls.Distance.Value = math.floor(data.distanceTraveled)
+        end
+
+        -- ── Milestones every 100 m ──
+        local milestone = math.floor(data.distanceTraveled / 100)
+        if milestone > data.lastMilestone then
+            data.lastMilestone = milestone
+            MilestoneUIEvent:FireClient(player, milestone * 100)
+            data.speed = data.speed + 2  -- milestone speed bonus
+        end
+
+        -- ── Auto-extend track if player approaches the end ──
+        local distToEnd = (trackEndCF.Position - root.Position).Magnitude
+        if distToEnd < STRAIGHT_LEN * 3 then
+            addSegment()
+            cleanupOldSegments()
         end
     end
-    playerData[player] = nil
 end)

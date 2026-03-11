@@ -1,40 +1,48 @@
--- MagnetManager.server.lua
--- Manages magnet pickup items on the track and the cupcake-attraction behaviour.
--- Changes from the old lane-based design:
---   * Removed LANE_X loop; magnets now spawn at a single random lateral offset
---     within the segment width (same approach as obstacles and cupcakes).
---   * Listens to the "SegmentCreated" BindableEvent fired by runner.server.lua
---     to receive (segFolder, segCFrame) for each new segment.
---   * Attraction loop pulls nearby Cupcake parts toward the player while active.
+--[[
+  MagnetManager.server.lua
+  Manages the collection-magnet power-up.
 
-local Players       = game:GetService("Players")
-local RunService    = game:GetService("RunService")
+  Changes from the lane-based version
+  ─────────────────────────────────────
+  • No per-lane spawning.  Magnet pick-ups are spawned randomly along
+    segment platforms by runner.server.lua.
+  • Uses CollectionService ("Cupcake" tag) instead of scanning
+    Workspace:GetDescendants() for better performance.
+  • When a player's magnet is active, all tagged Cupcake parts within
+    MAGNET_RADIUS studs are attracted toward the player's HumanoidRootPart.
+--]]
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local ServerStorage = game:GetService("ServerStorage")
+local CollectionService = game:GetService("CollectionService")
 
--- ── Constants ─────────────────────────────────────────────────────────────────
-local MAGNET_SPAWN_CHANCE   = 0.20   -- probability of spawning a magnet per segment
-local MAGNET_ATTRACT_RADIUS = 25     -- studs
-local MAGNET_ATTRACT_SPEED  = 35     -- studs/s
-local MAGNET_DURATION       = 10     -- seconds the effect lasts
+local MAGNET_RADIUS   = 30    -- studs — cupcakes inside this range are attracted
+local ATTRACT_SPEED   = 50    -- studs / s — attraction speed
+local MAGNET_DURATION = 15    -- seconds — how long a magnet lasts
+local HEARTBEAT_DT    = 1/60  -- approximate dt for cupcake movement
 
-local SEGMENT_WIDTH         = 30
-local FLOOR_THICKNESS       = 2
-local OBSTACLE_MARGIN       = 4
-local SPAWN_HEIGHT          = 1.5    -- above floor surface
+-- ── Remote events ──────────────────────────────────────────────────────────
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 20)
 
--- ── Remote events ─────────────────────────────────────────────────────────────
--- runner.server.lua creates the RunnerRemotes folder and MagnetStatus event
--- before any player joins.  Use WaitForChild so MagnetManager works regardless
--- of which server script starts first.
-local Remotes      = ReplicatedStorage:WaitForChild("RunnerRemotes")
-local MagnetStatus = Remotes:WaitForChild("MagnetStatus")
+local function waitOrMake(name)
+    local e = Remotes:FindFirstChild(name)
+    if not e then
+        -- Runner may not have created it yet; wait briefly before creating
+        e = Remotes:WaitForChild(name, 5)
+        if not e then
+            e        = Instance.new("RemoteEvent")
+            e.Name   = name
+            e.Parent = Remotes
+        end
+    end
+    return e
+end
 
--- ── BindableEvent from runner.server.lua ─────────────────────────────────────
-local SegmentCreated = ServerStorage:WaitForChild("SegmentCreated")
+local MagnetStatusEvent = waitOrMake("MagnetStatus")
 
--- ── Per-player magnet state ───────────────────────────────────────────────────
-local playerMagnets = {}   -- [Player] = { active: bool, endTime: number }
+-- ── Per-player magnet state ────────────────────────────────────────────────
+local playerMagnets = {}
 
 Players.PlayerAdded:Connect(function(player)
     playerMagnets[player] = { active = false, endTime = 0 }
@@ -44,99 +52,66 @@ Players.PlayerRemoving:Connect(function(player)
     playerMagnets[player] = nil
 end)
 
--- ── Spawn a magnet pickup on a segment ───────────────────────────────────────
--- segCFrame is the CFrame at the start of the segment (same reference used for
--- obstacles and cupcakes in runner.server.lua).
-local function spawnOnSegment(segFolder, segCFrame)
-    if math.random() > MAGNET_SPAWN_CHANCE then return end
+-- Seed table for players already in-game when this script loads
+for _, player in ipairs(Players:GetPlayers()) do
+    playerMagnets[player] = { active = false, endTime = 0 }
+end
 
-    -- Random lateral offset within the track width
-    local halfW   = SEGMENT_WIDTH / 2 - OBSTACLE_MARGIN
-    local xOffset = math.random() * halfW * 2 - halfW
-    -- Random position along the segment (avoid the very start and end)
-    local zOffset = -(math.random() * 50 + 10)
-    local yOffset = FLOOR_THICKNESS / 2 + SPAWN_HEIGHT
-
-    local worldCF = segCFrame * CFrame.new(xOffset, yOffset, zOffset)
-
-    local magnet        = Instance.new("Part")
-    magnet.Name         = "Magnet"
-    magnet.Shape        = Enum.PartType.Ball
-    magnet.Size         = Vector3.new(2.5, 2.5, 2.5)
-    magnet.BrickColor   = BrickColor.new("Electric blue")
-    magnet.Material     = Enum.Material.Neon
-    magnet.Anchored     = true
-    magnet.CanCollide   = false
-    magnet.CFrame       = worldCF
-    magnet.Parent       = segFolder
-
-    local collected = false
-    magnet.Touched:Connect(function(hit)
-        if collected then return end
+-- ── Magnet part touch handler ─────────────────────────────────────────────
+-- Called by runner.server.lua indirectly: magnet parts are named "Magnet"
+-- and tagged "MagnetPickup".  We listen via CollectionService.
+local function onMagnetAdded(part)
+    part.Touched:Connect(function(hit)
         local char   = hit.Parent
         local player = Players:GetPlayerFromCharacter(char)
         if not player then return end
 
-        collected = true
-        magnet:Destroy()
+        local mData = playerMagnets[player]
+        if not mData then return end
 
-        -- Activate magnetic attraction for this player
-        local entry     = playerMagnets[player]
-        if not entry then return end
-
-        entry.active    = true
-        entry.endTime   = tick() + MAGNET_DURATION
-
-        MagnetStatus:FireClient(player, true)
-
-        task.delay(MAGNET_DURATION, function()
-            local current = playerMagnets[player]
-            if current and tick() >= current.endTime then
-                current.active = false
-                MagnetStatus:FireClient(player, false)
-            end
-        end)
+        -- Activate / refresh magnet duration
+        mData.active  = true
+        mData.endTime = os.clock() + MAGNET_DURATION
+        MagnetStatusEvent:FireClient(player, true)
+        part:Destroy()
     end)
 end
 
--- ── Listen for new segments ───────────────────────────────────────────────────
-SegmentCreated.Event:Connect(function(segFolder, segCFrame)
-    spawnOnSegment(segFolder, segCFrame)
-end)
+-- Hook any magnet parts that already exist or get added later
+CollectionService:GetInstanceAddedSignal("MagnetPickup"):Connect(onMagnetAdded)
+for _, part in ipairs(CollectionService:GetTagged("MagnetPickup")) do
+    onMagnetAdded(part)
+end
 
--- ── Attraction heartbeat ──────────────────────────────────────────────────────
--- Pulls Cupcake parts within MAGNET_ATTRACT_RADIUS toward the player while active.
-RunService.Heartbeat:Connect(function(dt)
-    for player, entry in pairs(playerMagnets) do
-        if not entry.active then continue end
-        if tick() > entry.endTime then
-            entry.active = false
-            MagnetStatus:FireClient(player, false)
+-- ── Heartbeat: attract cupcakes toward active magnet players ──────────────
+RunService.Heartbeat:Connect(function()
+    local now = os.clock()
+
+    for player, mData in pairs(playerMagnets) do
+        if not mData.active then continue end
+
+        -- Check expiry
+        if now > mData.endTime then
+            mData.active = false
+            MagnetStatusEvent:FireClient(player, false)
             continue
         end
 
-        local char     = player.Character
+        local char = player.Character
         if not char then continue end
-        local rootPart = char:FindFirstChild("HumanoidRootPart")
-        if not rootPart then continue end
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if not root then continue end
 
-        local playerPos = rootPart.Position
+        local rootPos = root.Position
 
-        -- Scan workspace descendants for cupcakes to attract.
-        -- NOTE: GetDescendants() every heartbeat is intentionally simple for a
-        -- prototype; replace with a tracked cupcake table for better performance.
-        for _, obj in ipairs(workspace:GetDescendants()) do
-            if obj.Name == "Cupcake" and obj:IsA("BasePart") then
-                -- Guard: part may have been collected/destroyed on this same frame
-                if not obj.Parent then continue end
-                local dist = (obj.Position - playerPos).Magnitude
-                if dist < MAGNET_ATTRACT_RADIUS and dist > 0.5 then
-                    local dir  = (playerPos - obj.Position).Unit
-                    -- Use pcall to safely skip parts destroyed mid-iteration
-                    pcall(function()
-                        obj.CFrame = CFrame.new(obj.Position + dir * MAGNET_ATTRACT_SPEED * dt)
-                    end)
-                end
+        -- Iterate over all tagged cupcakes (much cheaper than GetDescendants)
+        for _, cup in ipairs(CollectionService:GetTagged("Cupcake")) do
+            if not cup or not cup.Parent then continue end
+
+            local dist = (cup.Position - rootPos).Magnitude
+            if dist <= MAGNET_RADIUS and dist > 0.5 then
+                local dir    = (rootPos - cup.Position).Unit
+                cup.CFrame   = cup.CFrame + dir * ATTRACT_SPEED * HEARTBEAT_DT
             end
         end
     end

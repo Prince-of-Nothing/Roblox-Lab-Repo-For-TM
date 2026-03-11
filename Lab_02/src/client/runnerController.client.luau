@@ -1,176 +1,234 @@
--- runnerController.client.luau
--- Client-side controller for the free-steering endless runner.
--- Responsibilities:
---   * Read A/D and Left/Right arrow input and send TurnAxis to server via RunnerSteer
---   * No lane teleport logic (LaneSwitch / laneIndex / LANE_X completely removed)
---   * Listen for milestone UI, speed UI, and magnet status events from server
+--[[
+  runnerController.client.luau
+  Free-steering endless runner — client input & UI.
+
+  Lane system removed.  The player now steers freely left/right with A/D
+  (or Left/Right arrows).  The axis (-1..1) is sent to the server via
+  TurnInput.  The server applies yaw to the character root and keeps the
+  LinearVelocity aligned with the resulting LookVector.
+
+  RunnerAdvance is fired when the player has travelled far enough from the
+  last advance position (distance-based, not Z-threshold).
+--]]
 
 local Players           = game:GetService("Players")
 local UserInputService  = game:GetService("UserInputService")
 local RunService        = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
--- ── Wait for server remotes ───────────────────────────────────────────────────
-local Remotes          = ReplicatedStorage:WaitForChild("RunnerRemotes")
-local RunnerSteer      = Remotes:WaitForChild("RunnerSteer")
-local MilestoneUIEvent = Remotes:WaitForChild("MilestoneUIEvent", 10)
-local SpeedUpdate      = Remotes:WaitForChild("SpeedUpdate",      10)
-local MagnetStatus     = Remotes:WaitForChild("MagnetStatus",     10)
+local player = Players.LocalPlayer
 
-if not MilestoneUIEvent then warn("[runnerController] MilestoneUIEvent remote not found") end
-if not SpeedUpdate      then warn("[runnerController] SpeedUpdate remote not found")      end
-if not MagnetStatus     then warn("[runnerController] MagnetStatus remote not found")     end
+-- ── Wait for remotes ──────────────────────────────────────────────────────
+local Remotes            = ReplicatedStorage:WaitForChild("Remotes", 20)
+local TurnInputEvent     = Remotes:WaitForChild("TurnInput",       20)
+local RunnerAdvanceEvent = Remotes:WaitForChild("RunnerAdvance",   20)
+local SpeedUpdateEvent   = Remotes:WaitForChild("SpeedUpdate",     20)
+local MilestoneUIEvent   = Remotes:WaitForChild("MilestoneUIEvent",20)
+local MagnetStatusEvent  = Remotes:WaitForChild("MagnetStatus",    20)
 
-local localPlayer      = Players.LocalPlayer
+if not MagnetStatusEvent then warn("[runnerController] MagnetStatus remote not found") end
 
--- ── Steering input state ──────────────────────────────────────────────────────
--- Positive turnAxis = turn right (D / Right), negative = turn left (A / Left)
-local turnLeft  = false
-local turnRight = false
+-- ── Input state ───────────────────────────────────────────────────────────
+local leftHeld  = false
+local rightHeld = false
 
--- Key bindings for steering
-local LEFT_KEYS  = { Enum.KeyCode.A, Enum.KeyCode.Left  }
-local RIGHT_KEYS = { Enum.KeyCode.D, Enum.KeyCode.Right }
+local TURN_KEYS_LEFT  = { Enum.KeyCode.A, Enum.KeyCode.Left  }
+local TURN_KEYS_RIGHT = { Enum.KeyCode.D, Enum.KeyCode.Right }
 
-local function isLeft(key)
-    for _, k in ipairs(LEFT_KEYS) do
-        if key == k then return true end
+local function isLeft(kc)
+    for _, k in ipairs(TURN_KEYS_LEFT) do
+        if kc == k then return true end
     end
     return false
 end
 
-local function isRight(key)
-    for _, k in ipairs(RIGHT_KEYS) do
-        if key == k then return true end
+local function isRight(kc)
+    for _, k in ipairs(TURN_KEYS_RIGHT) do
+        if kc == k then return true end
     end
     return false
 end
 
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed then return end
-    if isLeft(input.KeyCode)  then turnLeft  = true end
-    if isRight(input.KeyCode) then turnRight = true end
-end)
-
-UserInputService.InputEnded:Connect(function(input)
-    if isLeft(input.KeyCode)  then turnLeft  = false end
-    if isRight(input.KeyCode) then turnRight = false end
-end)
-
--- ── Send steering to server every frame ───────────────────────────────────────
--- We send on every RenderStepped so the server always has fresh input.
--- The value is discrete: -1, 0, or +1.
-local lastSentAxis = 0
-RunService.RenderStepped:Connect(function()
-    local axis = 0
-    if turnLeft  then axis = axis - 1 end
-    if turnRight then axis = axis + 1 end
-
-    -- Only fire when the value changes to avoid unnecessary network traffic
-    if axis ~= lastSentAxis then
-        lastSentAxis = axis
-        RunnerSteer:FireServer(axis)
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    local kc = input.KeyCode
+    if isLeft(kc) then
+        leftHeld = true
+    elseif isRight(kc) then
+        rightHeld = true
+    elseif kc == Enum.KeyCode.Space then
+        local char = player.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then hum.Jump = true end
+        end
     end
 end)
 
--- ── Milestone UI ──────────────────────────────────────────────────────────────
-if MilestoneUIEvent then
-    MilestoneUIEvent.OnClientEvent:Connect(function(milestone)
-        -- Display a simple screen notification
-        local screenGui      = Instance.new("ScreenGui")
-        screenGui.Name       = "MilestonePopup"
-        screenGui.ResetOnSpawn = false
+UserInputService.InputEnded:Connect(function(input, _processed)
+    local kc = input.KeyCode
+    if isLeft(kc) then
+        leftHeld = false
+    elseif isRight(kc) then
+        rightHeld = false
+    end
+end)
 
-        local label          = Instance.new("TextLabel")
-        label.Size           = UDim2.new(0, 320, 0, 60)
-        label.Position       = UDim2.new(0.5, -160, 0.25, 0)
-        label.BackgroundColor3 = Color3.fromRGB(255, 200, 0)
-        label.TextColor3     = Color3.fromRGB(20, 20, 20)
-        label.TextScaled     = true
-        label.Font           = Enum.Font.GothamBold
-        label.Text           = "🏁 " .. tostring(milestone) .. " studs!"
-        label.Parent         = screenGui
+-- ── Send TurnInput to server ──────────────────────────────────────────────
+-- Rate-limited: send at most every SEND_INTERVAL seconds.
+local SEND_INTERVAL = 0.05   -- 20 Hz
+local lastSend      = 0
+local lastAxis      = 0
 
-        screenGui.Parent     = localPlayer.PlayerGui
+RunService.Heartbeat:Connect(function()
+    local axis
+    if leftHeld and not rightHeld then
+        axis = -1
+    elseif rightHeld and not leftHeld then
+        axis = 1
+    else
+        axis = 0
+    end
 
-        task.delay(2.5, function()
-            if screenGui.Parent then
-                screenGui:Destroy()
-            end
-        end)
-    end)
+    local now = os.clock()
+    -- Only send if axis changed or interval elapsed
+    if axis ~= lastAxis or (now - lastSend) >= SEND_INTERVAL then
+        lastSend  = now
+        lastAxis  = axis
+        TurnInputEvent:FireServer(axis)
+    end
+end)
+
+-- ── Distance-based RunnerAdvance ──────────────────────────────────────────
+-- Fire when the player has moved ADVANCE_DIST studs since the last fire.
+local ADVANCE_DIST    = 50
+local lastAdvancePos  = nil
+
+RunService.Heartbeat:Connect(function()
+    local char = player.Character
+    if not char then lastAdvancePos = nil; return end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    if not lastAdvancePos then
+        lastAdvancePos = root.Position
+        return
+    end
+
+    if (root.Position - lastAdvancePos).Magnitude >= ADVANCE_DIST then
+        lastAdvancePos = root.Position
+        RunnerAdvanceEvent:FireServer()
+    end
+end)
+
+-- ── HUD: speed display ────────────────────────────────────────────────────
+local function getOrMakeHUD()
+    local gui = player.PlayerGui:FindFirstChild("RunnerHUD")
+    if gui then return gui end
+
+    gui          = Instance.new("ScreenGui")
+    gui.Name     = "RunnerHUD"
+    gui.ResetOnSpawn = false
+    gui.Parent   = player.PlayerGui
+
+    -- Speed label (bottom-left)
+    local speedLabel         = Instance.new("TextLabel")
+    speedLabel.Name          = "SpeedLabel"
+    speedLabel.Size          = UDim2.new(0.2, 0, 0.06, 0)
+    speedLabel.Position      = UDim2.new(0.01, 0, 0.88, 0)
+    speedLabel.BackgroundTransparency = 0.5
+    speedLabel.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    speedLabel.TextColor3    = Color3.fromRGB(255, 255, 255)
+    speedLabel.TextScaled    = true
+    speedLabel.Font          = Enum.Font.GothamBold
+    speedLabel.Text          = "Speed: --"
+    speedLabel.Parent        = gui
+
+    -- Steering hint (bottom-centre)
+    local hintLabel          = Instance.new("TextLabel")
+    hintLabel.Name           = "HintLabel"
+    hintLabel.Size           = UDim2.new(0.4, 0, 0.05, 0)
+    hintLabel.Position       = UDim2.new(0.3, 0, 0.94, 0)
+    hintLabel.BackgroundTransparency = 1
+    hintLabel.TextColor3     = Color3.fromRGB(200, 200, 200)
+    hintLabel.TextScaled     = true
+    hintLabel.Font           = Enum.Font.Gotham
+    hintLabel.Text           = "A / D  —  Steer    Space  —  Jump"
+    hintLabel.Parent         = gui
+
+    return gui
 end
 
--- ── Speed UI ──────────────────────────────────────────────────────────────────
--- Create a small persistent HUD label that shows the current speed multiplier.
-local speedGui        = Instance.new("ScreenGui")
-speedGui.Name         = "SpeedHUD"
-speedGui.ResetOnSpawn = false
-speedGui.Parent       = localPlayer.PlayerGui
+SpeedUpdateEvent.OnClientEvent:Connect(function(newSpeed)
+    local gui   = getOrMakeHUD()
+    local label = gui:FindFirstChild("SpeedLabel")
+    if label then
+        label.Text = string.format("Speed: %.0f", newSpeed)
+    end
+end)
 
-local speedLabel      = Instance.new("TextLabel")
-speedLabel.Name       = "SpeedLabel"
-speedLabel.Size       = UDim2.new(0, 180, 0, 40)
-speedLabel.Position   = UDim2.new(1, -190, 0, 10)
-speedLabel.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-speedLabel.BackgroundTransparency = 0.45
-speedLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-speedLabel.TextScaled = true
-speedLabel.Font       = Enum.Font.Gotham
-speedLabel.Text       = "Speed: 1.0×"
-speedLabel.Parent     = speedGui
+-- Initialise HUD on load
+task.spawn(function()
+    task.wait(2)
+    getOrMakeHUD()
+end)
 
-if SpeedUpdate then
-    SpeedUpdate.OnClientEvent:Connect(function(multiplier)
-        speedLabel.Text = string.format("Speed: %.1f×", multiplier)
+-- ── Milestone UI ──────────────────────────────────────────────────────────
+MilestoneUIEvent.OnClientEvent:Connect(function(distance)
+    local gui = player.PlayerGui:FindFirstChild("MilestoneGui")
+    if not gui then
+        gui              = Instance.new("ScreenGui")
+        gui.Name         = "MilestoneGui"
+        gui.ResetOnSpawn = false
+        gui.Parent       = player.PlayerGui
+    end
+
+    local label = gui:FindFirstChild("MilestoneLabel")
+    if not label then
+        label                    = Instance.new("TextLabel")
+        label.Name               = "MilestoneLabel"
+        label.Size               = UDim2.new(0.5, 0, 0.12, 0)
+        label.Position           = UDim2.new(0.25, 0, 0.08, 0)
+        label.BackgroundTransparency = 0.4
+        label.BackgroundColor3   = Color3.fromRGB(0, 0, 0)
+        label.TextColor3         = Color3.fromRGB(255, 215, 0)
+        label.TextScaled         = true
+        label.Font               = Enum.Font.GothamBold
+        label.Parent             = gui
+    end
+
+    label.Text    = string.format("🏃 %d m reached!", distance)
+    label.Visible = true
+
+    task.delay(3, function()
+        if label and label.Parent then
+            label.Visible = false
+        end
     end)
-end
+end)
 
--- ── Magnet status UI ──────────────────────────────────────────────────────────
+-- ── Magnet status HUD ─────────────────────────────────────────────────────
+-- Shows a visible indicator while the magnet power-up is active.
 local magnetGui        = Instance.new("ScreenGui")
 magnetGui.Name         = "MagnetHUD"
 magnetGui.ResetOnSpawn = false
-magnetGui.Parent       = localPlayer.PlayerGui
+magnetGui.Parent       = player.PlayerGui
 
-local magnetLabel      = Instance.new("TextLabel")
-magnetLabel.Name       = "MagnetLabel"
-magnetLabel.Size       = UDim2.new(0, 180, 0, 40)
-magnetLabel.Position   = UDim2.new(1, -190, 0, 60)
-magnetLabel.BackgroundColor3 = Color3.fromRGB(0, 80, 200)
-magnetLabel.BackgroundTransparency = 0.45
-magnetLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-magnetLabel.TextScaled = true
-magnetLabel.Font       = Enum.Font.GothamBold
-magnetLabel.Text       = ""
-magnetLabel.Visible    = false
-magnetLabel.Parent     = magnetGui
+local magnetLabel                  = Instance.new("TextLabel")
+magnetLabel.Name                   = "MagnetLabel"
+magnetLabel.Size                   = UDim2.new(0.25, 0, 0.06, 0)
+magnetLabel.Position               = UDim2.new(0.375, 0, 0.02, 0)
+magnetLabel.BackgroundColor3       = Color3.fromRGB(0, 80, 200)
+magnetLabel.BackgroundTransparency = 0.3
+magnetLabel.TextColor3             = Color3.fromRGB(255, 255, 255)
+magnetLabel.TextScaled             = true
+magnetLabel.Font                   = Enum.Font.GothamBold
+magnetLabel.Text                   = "MAGNET ACTIVE"
+magnetLabel.Visible                = false
+magnetLabel.Parent                 = magnetGui
 
-if MagnetStatus then
-    MagnetStatus.OnClientEvent:Connect(function(active)
-        magnetLabel.Visible = active
-        magnetLabel.Text    = active and "🧲 MAGNET ACTIVE" or ""
+if MagnetStatusEvent then
+    MagnetStatusEvent.OnClientEvent:Connect(function(active)
+        magnetLabel.Visible = active == true
     end)
 end
-
--- ── Steering hint UI (shown briefly at start) ─────────────────────────────────
-local hintGui          = Instance.new("ScreenGui")
-hintGui.Name           = "SteerHint"
-hintGui.ResetOnSpawn   = false
-hintGui.Parent         = localPlayer.PlayerGui
-
-local hintLabel        = Instance.new("TextLabel")
-hintLabel.Size         = UDim2.new(0, 400, 0, 50)
-hintLabel.Position     = UDim2.new(0.5, -200, 0.85, 0)
-hintLabel.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-hintLabel.BackgroundTransparency = 0.5
-hintLabel.TextColor3   = Color3.fromRGB(255, 255, 255)
-hintLabel.TextScaled   = true
-hintLabel.Font         = Enum.Font.Gotham
-hintLabel.Text         = "A / Left Arrow = Turn Left    D / Right Arrow = Turn Right"
-hintLabel.Parent       = hintGui
-
-task.delay(5, function()
-    if hintGui.Parent then
-        hintGui:Destroy()
-    end
-end)

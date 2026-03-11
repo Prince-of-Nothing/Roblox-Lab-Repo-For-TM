@@ -1,0 +1,30 @@
+{
+  "name": "FreeSteering_Runner",
+  "tree": {
+    "$className": "DataModel",
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "runner": {
+        "$path": "src/server/runner.server.lua"
+      },
+      "MagnetManager": {
+        "$path": "src/server/MagnetManager.server.lua"
+      },
+      "Leaderstats": {
+        "$path": "src/ServerScriptService/Leaderstats.server.lua"
+      }
+    },
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "runnerController": {
+          "$path": "src/client/runnerController.client.luau"
+        }
+      }
+    },
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage"
+    }
+  }
+}
