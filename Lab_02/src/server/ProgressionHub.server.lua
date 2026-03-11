@@ -45,6 +45,10 @@ local UPGRADES = {
                       desc = "Begin runs at 8% lower speed per level." },
     score_mult    = { name = "Score Multiplier",          baseCost = 120, maxLevel = 3,
                       desc = "Final run score multiplied by 1.15x per level." },
+    life_saver    = { name = "Life Saver",                baseCost = 100, maxLevel = 3,
+                      desc = "Start each run with +1 maximum HP per level." },
+    speed_up      = { name = "Speed Boost",               baseCost = 75,  maxLevel = 3,
+                      desc = "Increase base run speed by 10% per level." },
 }
 
 -- Expose UPGRADES via _G so runner.server.lua can access without requiring

@@ -42,6 +42,8 @@ local SelectDiffEvt     = Remotes:WaitForChild("SelectDifficulty", 20)
 local BuyUpgradeEvt     = Remotes:WaitForChild("BuyUpgrade",       20)
 local RequestRunEvt     = Remotes:WaitForChild("RequestRun",       20)
 local RunnerAdvanceEvt  = Remotes:WaitForChild("RunnerAdvance",    20)
+local LaneMoveStartEvt  = Remotes:WaitForChild("LaneMoveStart",    20)
+local LaneMoveStopEvt   = Remotes:WaitForChild("LaneMoveStop",     20)
 
 local SpeedUpdateEvt    = Remotes:WaitForChild("SpeedUpdate",      20)
 local MilestoneEvt      = Remotes:WaitForChild("MilestoneUIEvent", 20)
@@ -169,9 +171,9 @@ local scoreLabel = makeLabel(hudGui, "ScoreLabel",
 
 -- Controls hint (very bottom)
 local hintLabel = makeLabel(hudGui, "HintLabel",
-    UDim2.new(0.50, 0, 0.04, 0),
-    UDim2.new(0.25, 0, 0.95, 0),
-    "A/D - Lane   Space - Jump   S - Slide   Q/E/R/F - Abilities",
+    UDim2.new(0.60, 0, 0.04, 0),
+    UDim2.new(0.20, 0, 0.95, 0),
+    "Hold A/D - Move Left/Right   Space - Jump   S - Slide   Q/E/R/F - Abilities",
     Color3.fromRGB(180,180,180), Color3.fromRGB(0,0,0), 0.7,
     Enum.Font.Gotham)
 
@@ -326,12 +328,14 @@ local currencyLabel = makeLabel(hubBg, "CurrencyLabel",
     "Currency: 0", Color3.fromRGB(255,220,80), Color3.fromRGB(0,0,0), 0.5, Enum.Font.GothamBold, 9)
 
 local UPGRADE_DISPLAY = {
-    { id="move_speed",    label="Movement Efficiency",     desc="+Faster lane switching"     },
-    { id="ability_cap",   label="Ability Capacity",        desc="+1 ability charge per level"},
-    { id="ability_cd",    label="Ability Cooldown",        desc="-15% cooldown per level"    },
-    { id="magnet_radius", label="Magnet Radius",           desc="+Item attraction range"     },
-    { id="start_slow",    label="Starting Speed Control",  desc="-8% start speed per level"  },
-    { id="score_mult",    label="Score Multiplier",        desc="+15% final score per level" },
+    { id="move_speed",    label="Movement Efficiency",     desc="+20% lateral speed per level"  },
+    { id="ability_cap",   label="Ability Capacity",        desc="+1 ability charge per level"   },
+    { id="ability_cd",    label="Ability Cooldown",        desc="-15% cooldown per level"       },
+    { id="magnet_radius", label="Collection Magnet",       desc="+5 stud attraction range/level"},
+    { id="start_slow",    label="Speed Reducer",           desc="-8% start speed per level"     },
+    { id="score_mult",    label="Score Multiplier",        desc="+15% final score per level"    },
+    { id="life_saver",    label="Life Saver",              desc="+1 max HP per level"           },
+    { id="speed_up",      label="Speed Boost",             desc="+10% base speed per level"     },
 }
 
 local upgradeBtnRefs = {}
@@ -340,10 +344,10 @@ for i, upg in ipairs(UPGRADE_DISPLAY) do
     local col = (i-1) % 3
     local row = math.floor((i-1) / 3)
     local xPos = 0.05 + col * 0.33
-    local yPos = 0.20 + row * 0.23
+    local yPos = 0.18 + row * 0.20   -- tighter row spacing to fit 3 rows
 
     local frame = Instance.new("Frame")
-    frame.Size                  = UDim2.new(0.30, 0, 0.20, 0)
+    frame.Size                  = UDim2.new(0.30, 0, 0.175, 0)  -- slightly shorter for 3-row fit
     frame.Position              = UDim2.new(xPos, 0, yPos, 0)
     frame.BackgroundColor3      = Color3.fromRGB(20,20,50)
     frame.BackgroundTransparency = 0.3
@@ -378,12 +382,12 @@ for i, upg in ipairs(UPGRADE_DISPLAY) do
 end
 
 local hubBackBtn = makeButton(hubBg, "BackBtn",
-    UDim2.new(0.30,0,0.07,0), UDim2.new(0.35,0,0.88,0),
+    UDim2.new(0.30,0,0.07,0), UDim2.new(0.35,0,0.90,0),
     "BACK TO DIFFICULTY SELECT", Color3.fromRGB(80,80,150))
 hubBackBtn.ZIndex = 9
 
 local hubPlayBtn = makeButton(hubBg, "PlayBtn",
-    UDim2.new(0.30,0,0.07,0), UDim2.new(0.35,0,0.79,0),
+    UDim2.new(0.30,0,0.07,0), UDim2.new(0.35,0,0.82,0),
     "START RUN", Color3.fromRGB(80,180,80))
 hubPlayBtn.ZIndex = 9
 
@@ -433,30 +437,18 @@ end
 
 -- ── Input State ───────────────────────────────────────────────────────────────
 local keyHeld = {}
-local lastLaneSent = 3
-local laneSendCooldown = 0
-local LANE_SEND_CD = 0.15   -- seconds between lane switch sends to avoid spamming
-
-local function tryLaneSwitch(direction)
-    local now = os.clock()
-    if now - laneSendCooldown < LANE_SEND_CD then return end
-    laneSendCooldown = now
-
-    local newLane = math.clamp(currentLane + direction, 1, NUM_LANES)
-    if newLane == currentLane then return end
-
-    currentLane = newLane
-    LaneSwitchEvt:FireServer(currentLane)
-end
 
 UserInputService.InputBegan:Connect(function(input, processed)
     if processed then return end
     local kc = input.KeyCode
     keyHeld[kc] = true
 
-    -- Lane movement (one tap per press)
-    if kc == Enum.KeyCode.A or kc == Enum.KeyCode.Left  then tryLaneSwitch(-1) end
-    if kc == Enum.KeyCode.D or kc == Enum.KeyCode.Right then tryLaneSwitch(1)  end
+    -- Hold-to-move lateral: server applies continuous lateral velocity while held
+    if kc == Enum.KeyCode.A or kc == Enum.KeyCode.Left then
+        if isRunActive then LaneMoveStartEvt:FireServer(-1) end
+    elseif kc == Enum.KeyCode.D or kc == Enum.KeyCode.Right then
+        if isRunActive then LaneMoveStartEvt:FireServer(1) end
+    end
 
     -- Jump
     if kc == Enum.KeyCode.Space then
@@ -495,13 +487,19 @@ UserInputService.InputBegan:Connect(function(input, processed)
         abilActiveLabel.TextColor3 = Color3.fromRGB(255,150,80)
         abilActiveLabel.Visible = true
         task.delay(0.5, function() abilActiveLabel.Visible = false end)
-        -- Update local lane after dash (+2)
-        currentLane = math.clamp(currentLane + 2, 1, NUM_LANES)
     end
 end)
 
 UserInputService.InputEnded:Connect(function(input, _)
-    keyHeld[input.KeyCode] = nil
+    local kc = input.KeyCode
+    keyHeld[kc] = nil
+    -- Stop lateral movement when the key is released; pass direction so server
+    -- won't cancel an override from the opposite key still being held.
+    if kc == Enum.KeyCode.A or kc == Enum.KeyCode.Left then
+        if isRunActive then LaneMoveStopEvt:FireServer(-1) end
+    elseif kc == Enum.KeyCode.D or kc == Enum.KeyCode.Right then
+        if isRunActive then LaneMoveStopEvt:FireServer(1) end
+    end
 end)
 
 -- ── Distance-based RunnerAdvance ───────────────────────────────────────────────
@@ -533,6 +531,9 @@ RunStartEvt.OnClientEvent:Connect(function(difficulty)
     currentDifficulty = difficulty or "normal"
     abilityCooldowns  = {}
     lastAdvancePos    = nil
+
+    -- Ensure lateral movement is stopped for the new run
+    LaneMoveStopEvt:FireServer(0)
 
     hudGui.Enabled     = true
     resultsGui.Enabled = false
@@ -591,7 +592,13 @@ BiomeChangeEvt.OnClientEvent:Connect(function(biomeName)
 end)
 
 ObstacleHitEvt.OnClientEvent:Connect(function(obsType)
-    showBanner("HIT: " .. obsType:gsub("_", " "):upper(), Color3.fromRGB(255,80,80), 1.5)
+    if obsType == "out_of_bounds" then
+        showBanner("OUT OF BOUNDS!", Color3.fromRGB(255,80,80), 2)
+    elseif obsType == "fell_off_track" then
+        showBanner("FELL OFF TRACK!", Color3.fromRGB(255,80,80), 2)
+    else
+        showBanner("HIT: " .. obsType:gsub("_", " "):upper(), Color3.fromRGB(255,80,80), 1.5)
+    end
 end)
 
 MagnetStatusEvt.OnClientEvent:Connect(function(active, duration)
