@@ -104,12 +104,17 @@ RunService.Heartbeat:Connect(function()
 
         local rootPos = root.Position
 
+        -- Apply magnet_radius upgrade bonus (5 extra studs per level)
+        local persist       = _G.playerPersist and _G.playerPersist[tostring(player.UserId)]
+        local extraRadius   = persist and persist.upgrades and (persist.upgrades.magnet_radius or 0) * 5 or 0
+        local effectiveRadius = MAGNET_RADIUS + extraRadius
+
         -- Iterate over all tagged cupcakes (much cheaper than GetDescendants)
         for _, cup in ipairs(CollectionService:GetTagged("Cupcake")) do
             if not cup or not cup.Parent then continue end
 
             local dist = (cup.Position - rootPos).Magnitude
-            if dist <= MAGNET_RADIUS and dist > 0.5 then
+            if dist <= effectiveRadius and dist > 0.5 then
                 local dir    = (rootPos - cup.Position).Unit
                 cup.CFrame   = cup.CFrame + dir * ATTRACT_SPEED * HEARTBEAT_DT
             end

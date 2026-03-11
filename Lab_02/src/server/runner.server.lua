@@ -68,6 +68,8 @@ local SPEED_RAMP            = 0.4
 local SPEED_RAMP_INTERVAL   = 5
 local MILESTONE_SPEED_BONUS = 1.5
 local MAX_SPEED             = 90
+local LATERAL_SPEED         = 25   -- studs/s for hold-to-move lateral movement
+local MAGNET_SPAWN_CHANCE   = 0.10  -- 10% per segment
 
 local FLOOR_Y               = 50
 local FLOOR_THICK           = 2
@@ -159,6 +161,8 @@ local BuyUpgradeEvt     = getOrMake("BuyUpgrade")
 local RunnerAdvanceEvt  = getOrMake("RunnerAdvance")
 local RequestRunEvt     = getOrMake("RequestRun")
 getOrMake("MagnetStatus")
+local LaneMoveStartEvt  = getOrMake("LaneMoveStart")
+local LaneMoveStopEvt   = getOrMake("LaneMoveStop")
 
 -- Track state
 local trackFolder = Instance.new("Folder")
@@ -194,15 +198,17 @@ local function initRun(player, diff)
     local upg   = persist.upgrades
     local startSlowBonus = (upg.start_slow or 0) * 0.08
     local abilCapBonus   = upg.ability_cap or 0
-    local baseSpd = BASE_FORWARD_SPEED * s.speedMult * (1 - startSlowBonus)
+    local lifeSaverBonus = upg.life_saver or 0
+    local speedUpBonus   = (upg.speed_up or 0) * 0.10
+    local baseSpd = BASE_FORWARD_SPEED * s.speedMult * (1 - startSlowBonus) * (1 + speedUpBonus)
     local pd = {
         difficulty       = diff,
         settings         = s,
         laneIndex        = 3,
         currentSpeed     = baseSpd,
         speedBoost       = 0,
-        health           = 3,
-        maxHealth        = 3,
+        health           = 3 + lifeSaverBonus,
+        maxHealth        = 3 + lifeSaverBonus,
         shields          = 0,
         abilityCharges   = 1 + abilCapBonus,
         maxAbilCharges   = 3 + abilCapBonus,
@@ -219,8 +225,11 @@ local function initRun(player, diff)
         noHitBonus       = true,
         abilityCooldown  = {},
         linearVelocity   = nil,
+        alignOrient      = nil,
         rootPart         = nil,
         humanoid         = nil,
+        lateralDir       = 0,
+        lateralSpeed     = LATERAL_SPEED * (1 + (upg.move_speed or 0) * 0.2),
         runStartTime     = os.clock(),
         runEnded         = false,
     }
@@ -466,6 +475,21 @@ local function createSegment(idx, diff, runDist)
         end)
     end
 
+    -- Magnet pickup (rare collectible: handled by MagnetManager via CollectionService)
+    if idx >= SAFE_ZONE_SEGS and math.random() < MAGNET_SPAWN_CHANCE then
+        local laneIdx   = math.random(1, NUM_LANES)
+        local t         = math.random() * 0.70 + 0.15
+        local magZ      = segZ + (t - 0.5) * SEGMENT_LENGTH
+        local magPart   = makePart(Vector3.new(2.5, 2.5, 2.5), BrickColor.new("Bright blue"), true, false)
+        magPart.Name     = "MagnetPickup"
+        magPart.Shape    = Enum.PartType.Ball
+        magPart.Material = Enum.Material.Neon
+        magPart.CanTouch = true
+        magPart.CFrame   = CFrame.new(LANE_X[laneIdx], FLOOR_Y + FLOOR_THICK / 2 + 2.5, magZ)
+        magPart.Parent   = model
+        CollectionService:AddTag(magPart, "MagnetPickup")
+    end
+
     model.Parent = Workspace
     return model
 end
@@ -544,6 +568,7 @@ local function setupCharacter(player, char, pd)
     ao.Parent           = root
     hum.AutoRotate      = false
     pd.linearVelocity   = lv
+    pd.alignOrient      = ao
     pd.propAtt          = att
     SpeedUpdateEvt:FireClient(player, pd.currentSpeed / BASE_FORWARD_SPEED)
     HealthUpdateEvt:FireClient(player, pd.health, pd.maxHealth)
@@ -602,6 +627,7 @@ Players.PlayerRemoving:Connect(function(player)
 end)
 
 -- Remote Handlers
+-- LaneSwitchEvt kept for backward compat; teleports to an exact lane (used by dash ability)
 LaneSwitchEvt.OnServerEvent:Connect(function(player, newLane)
     local pd = _G.playerRunData[player]
     if not pd or not pd.isAlive then return end
@@ -610,6 +636,24 @@ LaneSwitchEvt.OnServerEvent:Connect(function(player, newLane)
     local root = pd.rootPart
     if root and root.Parent then
         root.CFrame = CFrame.new(LANE_X[newLane], root.Position.Y, root.Position.Z)
+    end
+end)
+
+-- Hold-to-move lateral controls
+LaneMoveStartEvt.OnServerEvent:Connect(function(player, dir)
+    local pd = _G.playerRunData[player]
+    if not pd or not pd.isAlive then return end
+    dir = tonumber(dir) or 0
+    if dir ~= -1 and dir ~= 1 then return end
+    pd.lateralDir = dir
+end)
+
+LaneMoveStopEvt.OnServerEvent:Connect(function(player, dir)
+    local pd = _G.playerRunData[player]
+    if not pd then return end
+    -- Only stop if currently moving in the given direction (prevents A-release canceling D-hold)
+    if pd.lateralDir == tonumber(dir) then
+        pd.lateralDir = 0
     end
 end)
 
@@ -740,13 +784,15 @@ RunService.Heartbeat:Connect(function()
 
         -- Fall off track
         if root.Position.Y < FLOOR_Y - 20 then
+            ObstacleHitEvt:FireClient(player, "fell_off_track")
             hum.Health = 0
             endRun(player, pd)
             continue
         end
 
-        -- Exit track sides
+        -- Exit track sides (out-of-bounds kill – walls are non-solid, crossing kills the player)
         if math.abs(root.Position.X) > SEGMENT_WIDTH / 2 + 5 then
+            ObstacleHitEvt:FireClient(player, "out_of_bounds")
             hum.Health = 0
             endRun(player, pd)
             continue
@@ -759,10 +805,21 @@ RunService.Heartbeat:Connect(function()
             pd.currentSpeed = math.min(pd.currentSpeed + SPEED_RAMP * s.speedMult, MAX_SPEED)
         end
 
-        -- Apply velocity
+        -- Update laneIndex from current X position (used by dash ability etc.)
+        local xPos = root.Position.X
+        pd.laneIndex = math.clamp(math.floor((xPos + 20) / 10 + 0.5) + 1, 1, NUM_LANES)
+
+        -- Apply velocity: forward speed + lateral hold-to-move
         if pd.linearVelocity and pd.linearVelocity.Parent then
-            local spd = pd.currentSpeed + (pd.speedBoost or 0)
-            pd.linearVelocity.VectorVelocity = Vector3.new(0, 0, -spd)
+            local spd  = pd.currentSpeed + (pd.speedBoost or 0)
+            local latV = (pd.lateralDir or 0) * (pd.lateralSpeed or LATERAL_SPEED)
+            pd.linearVelocity.VectorVelocity = Vector3.new(latV, 0, -spd)
+        end
+
+        -- Body tilt for visual turn feedback
+        if pd.alignOrient and pd.alignOrient.Parent then
+            local tilt = -(pd.lateralDir or 0) * math.rad(20)
+            pd.alignOrient.CFrame = CFrame.Angles(0, 0, tilt)
         end
 
         -- Distance tracking
