@@ -361,11 +361,11 @@ local playerData = {}
 -- "leaderstats" folder with a "Coins" IntValue.  We add "Score" and
 -- "Distance" to that existing folder rather than creating a duplicate.
 local function ensureLeaderstats(player)
-    -- Wait up to 5 seconds for Leaderstats.server.lua to create the folder.
-    local ls = player:FindFirstChild("leaderstats")
-        or player:WaitForChild("leaderstats", 5)
+    -- Use WaitForChild alone to avoid a TOCTOU race between FindFirstChild
+    -- and WaitForChild.  Five-second timeout is generous for server startup.
+    local ls = player:WaitForChild("leaderstats", 5)
     if not ls then
-        -- Fallback: create our own if the other script is absent.
+        -- Fallback: create our own if Leaderstats.server.lua is absent.
         ls        = Instance.new("Folder")
         ls.Name   = "leaderstats"
         ls.Parent = player
