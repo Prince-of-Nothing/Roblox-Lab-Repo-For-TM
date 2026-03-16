@@ -43,6 +43,7 @@ local SelectDiffEvt     = Remotes:WaitForChild("SelectDifficulty", 20)
 local BuyUpgradeEvt     = Remotes:WaitForChild("BuyUpgrade",       20)
 local RequestRunEvt     = Remotes:WaitForChild("RequestRun",       20)
 local RunnerAdvanceEvt  = Remotes:WaitForChild("RunnerAdvance",    20)
+local RequestShopStateEvt = Remotes:WaitForChild("RequestShopState", 20)
 local LaneMoveStartEvt  = Remotes:WaitForChild("LaneMoveStart",    20)
 local LaneMoveStopEvt   = Remotes:WaitForChild("LaneMoveStop",     20)
 
@@ -59,6 +60,8 @@ local UpgradeResultEvt  = Remotes:WaitForChild("UpgradeResult",    20)
 local ObstacleHitEvt    = Remotes:WaitForChild("ObstacleHit",      20)
 local AbilityCDEvt      = Remotes:WaitForChild("AbilityCooldown",  20)
 local MagnetStatusEvt   = Remotes:WaitForChild("MagnetStatus",     20)
+local ComboUpdateEvt    = Remotes:WaitForChild("ComboUpdate",      20)
+local ObjectiveUpdateEvt = Remotes:WaitForChild("ObjectiveUpdate", 20)
 
 -- Game state
 local currentLane       = 3     -- 1-5
@@ -174,6 +177,16 @@ local scoreLabel = makeLabel(hudGui, "ScoreLabel",
     UDim2.new(0.30, 0, 0.06, 0),
     UDim2.new(0.35, 0, 0.88, 0),
     "Score: 0  |  Dist: 0 m", Color3.fromRGB(255,220,100))
+
+local comboLabel = makeLabel(hudGui, "ComboLabel",
+    UDim2.new(0.16, 0, 0.06, 0),
+    UDim2.new(0.83, 0, 0.88, 0),
+    "Combo x1", Color3.fromRGB(255, 180, 80))
+
+local objectiveLabel = makeLabel(hudGui, "ObjectiveLabel",
+    UDim2.new(0.40, 0, 0.05, 0),
+    UDim2.new(0.30, 0, 0.82, 0),
+    "Objective: -", Color3.fromRGB(180, 255, 180), Color3.fromRGB(0,0,0), 0.45, Enum.Font.Gotham)
 
 -- Controls hint (very bottom)
 local hintLabel = makeLabel(hudGui, "HintLabel",
@@ -401,6 +414,7 @@ hubPlayBtn.ZIndex = 9
 local function toggleShop(show)
     hubGui.Enabled = show
     if show then
+        RequestShopStateEvt:FireServer()
         currencyLabel.Text = "Currency: " .. totalCurrency
         resultsGui.Enabled = false
         diffGui.Enabled    = false
@@ -452,6 +466,29 @@ local function describeEnding(reason)
         return "Left the course bounds."
     else
         return "Run ended."
+    end
+end
+
+local function updateComboHUD(combo, mult)
+    comboLabel.Text = string.format("Combo x%d  (chain: %d)", mult or 1, combo or 0)
+    if (mult or 1) > 1 then
+        comboLabel.TextColor3 = Color3.fromRGB(255, 120, 80)
+    else
+        comboLabel.TextColor3 = Color3.fromRGB(255, 180, 80)
+    end
+end
+
+local function updateObjectiveHUD(obj)
+    if not obj then
+        objectiveLabel.Text = "Objective: -"
+        return
+    end
+    if obj.completed then
+        objectiveLabel.Text = string.format("Objective complete: %s (+%d)", obj.label or "Task", obj.bonus or 0)
+        objectiveLabel.TextColor3 = Color3.fromRGB(120, 255, 120)
+    else
+        objectiveLabel.Text = string.format("Objective: %s %d/%d", obj.label or "Task", obj.progress or 0, obj.target or 0)
+        objectiveLabel.TextColor3 = Color3.fromRGB(180, 255, 180)
     end
 end
 
@@ -581,6 +618,8 @@ RunStartEvt.OnClientEvent:Connect(function(difficulty)
 
     updateHealthHUD(3, 3, 0)
     updateAbilityHUD(1)
+    updateComboHUD(0, 1)
+    updateObjectiveHUD(nil)
 
     showBanner("RUN STARTED  |  " .. (DIFF_NAMES[difficulty] or difficulty):upper(),
                diffColor, 2.5)
@@ -613,6 +652,14 @@ end)
 AbilityCDEvt.OnClientEvent:Connect(function(abilityName, cd)
     abilityCooldowns[abilityName] = os.clock() + cd
     updateAbilityHUD(currentCharges)
+end)
+
+ComboUpdateEvt.OnClientEvent:Connect(function(combo, mult)
+    updateComboHUD(combo, mult)
+end)
+
+ObjectiveUpdateEvt.OnClientEvent:Connect(function(obj)
+    updateObjectiveHUD(obj)
 end)
 
 MilestoneEvt.OnClientEvent:Connect(function(distance)
@@ -763,6 +810,8 @@ task.spawn(function()
     task.wait(1)
     updateHealthHUD(3, 3, 0)
     updateAbilityHUD(1)
+    updateComboHUD(0, 1)
+    updateObjectiveHUD(nil)
     speedLabel.Text = "Speed: 1.0x"
     scoreLabel.Text = "Score: 0  |  Dist: 0 m"
 end)

@@ -30,6 +30,7 @@ end
 local CurrencyUpdateEvent = waitRemote("CurrencyUpdate")
 local UpgradeResultEvent  = waitRemote("UpgradeResult")
 local BuyUpgradeEvent     = waitRemote("BuyUpgrade")
+local RequestShopStateEvent = waitRemote("RequestShopState")
 
 -- ── Upgrade Definitions ────────────────────────────────────────────────────────
 local UPGRADES = {
@@ -111,6 +112,10 @@ BuyUpgradeEvent.OnServerEvent:Connect(function(player, upgradeId)
 
     print(string.format("[ProgressionHub] %s purchased %s → Level %d",
           player.Name, upg.name, persist.upgrades[upgradeId]))
+end)
+
+RequestShopStateEvent.OnServerEvent:Connect(function(player)
+    broadcastState(player)
 end)
 
 -- ── Player Added: broadcast initial state after short delay ───────────────────

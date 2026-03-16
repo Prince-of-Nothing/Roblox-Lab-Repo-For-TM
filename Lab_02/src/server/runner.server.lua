@@ -77,6 +77,9 @@ local PATH_WAVELENGTH       = 180  -- studs per full sine wave
 
 -- End-of-course handling
 local END_DISTANCE          = 1200 -- reaching this distance triggers the "made it to the end" ending
+local COMBO_WINDOW          = 3.0  -- seconds to chain coin pickups
+local MAX_COMBO_MULT        = 5
+local OBJECTIVE_BONUS       = 35
 
 local FLOOR_Y               = 50
 local FLOOR_THICK           = 2
@@ -115,6 +118,7 @@ local COL_DEFS = {
     velocity_orb   = { color=BrickColor.new("Bright green"),  speedBoost=8, boostDur=5, w=15 },
     phase_fragment = { color=BrickColor.new("Bright violet"), abilCharge=true, w=12 },
     shield_item    = { color=BrickColor.new("White"),         shield=true, w=8 },
+    lucky_crate    = { color=BrickColor.new("Bright blue"),   lucky=true, size=2.7, w=7 },
 }
 local COL_TOTAL_W = 0
 for _, d in pairs(COL_DEFS) do COL_TOTAL_W = COL_TOTAL_W + d.w end
@@ -161,6 +165,8 @@ local CurrencyUpdateEvt = getOrMake("CurrencyUpdate")
 local UpgradeResultEvt  = getOrMake("UpgradeResult")
 local ObstacleHitEvt    = getOrMake("ObstacleHit")
 local AbilityCDEvt      = getOrMake("AbilityCooldown")
+local ComboUpdateEvt    = getOrMake("ComboUpdate")
+local ObjectiveUpdateEvt = getOrMake("ObjectiveUpdate")
 local LaneSwitchEvt     = getOrMake("LaneSwitch")
 local PlayerJumpEvt     = getOrMake("PlayerJump")
 local PlayerSlideEvt    = getOrMake("PlayerSlide")
@@ -169,6 +175,7 @@ local SelectDiffEvt     = getOrMake("SelectDifficulty")
 local BuyUpgradeEvt     = getOrMake("BuyUpgrade")
 local RunnerAdvanceEvt  = getOrMake("RunnerAdvance")
 local RequestRunEvt     = getOrMake("RequestRun")
+local RequestShopStateEvt = getOrMake("RequestShopState")
 getOrMake("MagnetStatus")
 local LaneMoveStartEvt  = getOrMake("LaneMoveStart")
 local LaneMoveStopEvt   = getOrMake("LaneMoveStop")
@@ -245,7 +252,29 @@ local function initRun(player, diff)
         lateralSpeed     = LATERAL_SPEED * (1 + (upg.move_speed or 0) * 0.2),
         runStartTime     = os.clock(),
         runEnded         = false,
+        combo            = 0,
+        comboMult        = 1,
+        comboTimeoutAt   = 0,
+        objective        = {
+            kind = "coins",
+            progress = 0,
+            target = 20,
+            completed = false,
+        },
     }
+
+    -- Rotate simple objective types per run for variety
+    local roll = math.random(1, 3)
+    if roll == 1 then
+        pd.objective.kind = "coins"
+        pd.objective.target = 20
+    elseif roll == 2 then
+        pd.objective.kind = "distance"
+        pd.objective.target = 350
+    else
+        pd.objective.kind = "obstacles"
+        pd.objective.target = 8
+    end
     _G.playerRunData[player] = pd
     return pd
 end
@@ -364,6 +393,42 @@ local function getBiome(dist)
         if dist >= b.trigDist then cur = b end
     end
     return cur
+end
+
+local function objectiveLabel(obj)
+    if not obj then return "" end
+    if obj.kind == "coins" then
+        return "Collect coins"
+    elseif obj.kind == "distance" then
+        return "Run distance"
+    elseif obj.kind == "obstacles" then
+        return "Survive obstacle hits"
+    end
+    return "Objective"
+end
+
+local function pushObjective(player, pd)
+    local obj = pd.objective
+    if not obj then return end
+    ObjectiveUpdateEvt:FireClient(player, {
+        kind = obj.kind,
+        label = objectiveLabel(obj),
+        progress = obj.progress,
+        target = obj.target,
+        completed = obj.completed,
+        bonus = OBJECTIVE_BONUS,
+    })
+end
+
+local function tryCompleteObjective(player, pd)
+    local obj = pd.objective
+    if not obj or obj.completed then return end
+    if obj.progress < obj.target then return end
+    obj.completed = true
+    local persist = getPersist(player)
+    persist.currency = (persist.currency or 0) + OBJECTIVE_BONUS
+    CurrencyUpdateEvt:FireClient(player, persist.currency)
+    pushObjective(player, pd)
 end
 
 -- Obstacle pattern generator
@@ -493,6 +558,10 @@ local function createSegment(idx, diff, runDist)
                     if typeName == "high_barrier" and pd.isSliding then return end
                     ObstacleHitEvt:FireClient(plr, typeName)
                     pd.noHitBonus = false
+                    pd.combo = 0
+                    pd.comboMult = 1
+                    pd.comboTimeoutAt = 0
+                    ComboUpdateEvt:FireClient(plr, pd.combo, pd.comboMult)
                     if pd.shields and pd.shields > 0 then
                         pd.shields = pd.shields - 1
                         ShieldUpdateEvt:FireClient(plr, pd.shields)
@@ -542,8 +611,28 @@ local function createSegment(idx, diff, runDist)
             grabbed = true
             col:Destroy()
             if def.coinVal then
-                pd.score = pd.score + def.coinVal
-                pd.coinsCollected = (pd.coinsCollected or 0) + def.coinVal
+                local now = os.clock()
+                if now <= (pd.comboTimeoutAt or 0) then
+                    pd.combo = (pd.combo or 0) + 1
+                else
+                    pd.combo = 1
+                end
+                pd.comboMult = math.clamp(1 + math.floor((pd.combo or 1) / 4), 1, MAX_COMBO_MULT)
+                pd.comboTimeoutAt = now + COMBO_WINDOW
+
+                local gained = def.coinVal * (pd.comboMult or 1)
+                pd.score = pd.score + gained
+                pd.coinsCollected = (pd.coinsCollected or 0) + gained
+                local persist = getPersist(plr)
+                persist.currency = (persist.currency or 0) + gained
+                CurrencyUpdateEvt:FireClient(plr, persist.currency)
+                ComboUpdateEvt:FireClient(plr, pd.combo, pd.comboMult)
+
+                if pd.objective and pd.objective.kind == "coins" then
+                    pd.objective.progress = math.min(pd.objective.target, (pd.objective.progress or 0) + gained)
+                    pushObjective(plr, pd)
+                    tryCompleteObjective(plr, pd)
+                end
                 if typeName == "energy_shard" or typeName == "mini_coin" or typeName == "mega_coin" then
                     pd.energyShards = (pd.energyShards or 0) + 1
                 elseif typeName == "data_cube" then
@@ -569,6 +658,25 @@ local function createSegment(idx, diff, runDist)
             elseif def.shield then
                 pd.shields = math.min((pd.shields or 0) + 1, 3)
                 ShieldUpdateEvt:FireClient(plr, pd.shields)
+            elseif def.lucky then
+                local reward = math.random(1, 4)
+                if reward == 1 then
+                    local bonus = math.random(10, 25)
+                    pd.coinsCollected = (pd.coinsCollected or 0) + bonus
+                    pd.score = pd.score + bonus
+                    local persist = getPersist(plr)
+                    persist.currency = (persist.currency or 0) + bonus
+                    CurrencyUpdateEvt:FireClient(plr, persist.currency)
+                elseif reward == 2 then
+                    pd.shields = math.min((pd.shields or 0) + 1, 3)
+                    ShieldUpdateEvt:FireClient(plr, pd.shields)
+                elseif reward == 3 then
+                    pd.abilityCharges = math.min((pd.abilityCharges or 0) + 1, pd.maxAbilCharges or 3)
+                    AbilityUpdateEvt:FireClient(plr, pd.abilityCharges)
+                else
+                    pd.health = math.min((pd.health or 1) + 1, pd.maxHealth or 3)
+                    HealthUpdateEvt:FireClient(plr, pd.health, pd.maxHealth)
+                end
             end
         end)
     end
@@ -673,6 +781,8 @@ local function setupCharacter(player, char, pd)
     HealthUpdateEvt:FireClient(player, pd.health, pd.maxHealth)
     ShieldUpdateEvt:FireClient(player, pd.shields)
     AbilityUpdateEvt:FireClient(player, pd.abilityCharges)
+    ComboUpdateEvt:FireClient(player, pd.combo, pd.comboMult)
+    pushObjective(player, pd)
     RunStartEvt:FireClient(player, pd.difficulty)
 end
 
@@ -690,7 +800,6 @@ local function endRun(player, pd, reason)
     local scoreMult   = 1 + 0.15 * (persist.upgrades.score_mult or 0)
     local finalScore  = math.floor((rawScore * s.speedMult + noHitBonus) * scoreMult)
     local currencyEarned = pd.coinsCollected or 0
-    persist.currency = persist.currency + currencyEarned
     local ls = player:FindFirstChild("leaderstats")
     if ls then
         if ls:FindFirstChild("Score")    then ls.Score.Value    = math.max(ls.Score.Value, finalScore) end
@@ -952,6 +1061,24 @@ RunService.Heartbeat:Connect(function()
         local ls = player:FindFirstChild("leaderstats")
         if ls and ls:FindFirstChild("Distance") then
             ls.Distance.Value = math.floor(pd.distanceTraveled)
+        end
+
+        if pd.objective and not pd.objective.completed then
+            if pd.objective.kind == "distance" then
+                pd.objective.progress = math.min(pd.objective.target, math.floor(pd.distanceTraveled))
+                pushObjective(player, pd)
+                tryCompleteObjective(player, pd)
+            elseif pd.objective.kind == "obstacles" then
+                pd.objective.progress = math.min(pd.objective.target, math.floor(pd.distanceTraveled / 50))
+                pushObjective(player, pd)
+                tryCompleteObjective(player, pd)
+            end
+        end
+
+        if (pd.combo or 0) > 0 and now > (pd.comboTimeoutAt or 0) then
+            pd.combo = 0
+            pd.comboMult = 1
+            ComboUpdateEvt:FireClient(player, pd.combo, pd.comboMult)
         end
 
         -- End-of-course ending (reach the end → die)
