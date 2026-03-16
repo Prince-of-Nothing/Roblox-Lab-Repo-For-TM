@@ -71,6 +71,13 @@ local MAX_SPEED             = 90
 local LATERAL_SPEED         = 25   -- studs/s for hold-to-move lateral movement
 local MAGNET_SPAWN_CHANCE   = 0.10  -- 10% per segment
 
+-- Wavy track pathing (course is not straight)
+local PATH_AMPLITUDE        = 16   -- studs of left/right sway
+local PATH_WAVELENGTH       = 180  -- studs per full sine wave
+
+-- End-of-course handling
+local END_DISTANCE          = 1200 -- reaching this distance triggers the "made it to the end" ending
+
 local FLOOR_Y               = 50
 local FLOOR_THICK           = 2
 local SEGMENT_LENGTH        = 60
@@ -101,8 +108,10 @@ for _, d in pairs(OBS_DEFS) do OBS_TOTAL_W = OBS_TOTAL_W + d.w end
 
 -- Collectible Type Definitions
 local COL_DEFS = {
-    energy_shard   = { color=BrickColor.new("Bright yellow"), coinVal=1,  w=55 },
-    data_cube      = { color=BrickColor.new("Cyan"),          coinVal=5,  w=10, rare=true },
+    mini_coin      = { color=BrickColor.new("New Yeller"),    coinVal=1,  size=1.4, w=25 },
+    energy_shard   = { color=BrickColor.new("Bright yellow"), coinVal=2,  size=2.0, w=35 },
+    data_cube      = { color=BrickColor.new("Cyan"),          coinVal=5,  size=2.5, w=12, rare=true },
+    mega_coin      = { color=BrickColor.new("Bright orange"), coinVal=10, size=3.2, w=6,  rare=true },
     velocity_orb   = { color=BrickColor.new("Bright green"),  speedBoost=8, boostDur=5, w=15 },
     phase_fragment = { color=BrickColor.new("Bright violet"), abilCharge=true, w=12 },
     shield_item    = { color=BrickColor.new("White"),         shield=true, w=8 },
@@ -172,6 +181,7 @@ trackFolder.Parent = Workspace
 local segments   = {}
 local nextSegIdx = 0
 local movObstacles = {}
+local endingSpawns = {}
 
 -- _G.playerPersist  – shared with ProgressionHub.server.lua
 --   Keyed by tostring(player.UserId).  Survives between runs in the same
@@ -213,6 +223,9 @@ local function initRun(player, diff)
         abilityCharges   = 1 + abilCapBonus,
         maxAbilCharges   = 3 + abilCapBonus,
         score            = 0,
+        coinsCollected   = 0,
+        dataCubes        = 0,
+        energyShards     = 0,
         distanceTraveled = 0,
         lastMilestone    = 0,
         lastRampTime     = os.clock(),
@@ -248,6 +261,73 @@ local function getRootPart(char)
     return char:FindFirstChildWhichIsA("BasePart")
 end
 
+-- Ending scene build (prison + loop room)
+local function buildEndingScenes()
+    local endingsFolder = Workspace:FindFirstChild("EndingScenes")
+    if endingsFolder then endingsFolder:Destroy() end
+    endingsFolder = Instance.new("Folder")
+    endingsFolder.Name = "EndingScenes"
+    endingsFolder.Parent = Workspace
+
+    -- Prison cell
+    local prisonModel = Instance.new("Model")
+    prisonModel.Name = "PrisonCell"
+    prisonModel.Parent = endingsFolder
+    local cellCenter = Vector3.new(120, FLOOR_Y, 80)
+    local floor = makePart(Vector3.new(30, 1, 30), BrickColor.new("Dark stone grey"), true, true, Enum.Material.Metal)
+    floor.CFrame = CFrame.new(cellCenter.X, FLOOR_Y - 1, cellCenter.Z)
+    floor.Parent = prisonModel
+    for _, dir in ipairs({ Vector3.new(0,0,-15), Vector3.new(0,0,15), Vector3.new(-15,0,0), Vector3.new(15,0,0) }) do
+        local wall = makePart(Vector3.new(30, 16, 1), BrickColor.new("Really black"), true, true, Enum.Material.Metal)
+        wall.CFrame = CFrame.new(cellCenter + dir + Vector3.new(0,8,0))
+        wall.Parent = prisonModel
+    end
+    local bars = makePart(Vector3.new(30, 16, 0.3), BrickColor.new("Medium stone grey"), true, true, Enum.Material.Metal)
+    bars.Transparency = 0.35
+    bars.CFrame = CFrame.new(cellCenter + Vector3.new(0,8,14.7))
+    bars.Parent = prisonModel
+    local sign = makePart(Vector3.new(10, 3, 0.5), BrickColor.new("Bright red"), true, true, Enum.Material.Neon)
+    sign.CFrame = CFrame.new(cellCenter + Vector3.new(0,10,15.6))
+    sign.Parent = prisonModel
+    local signText = Instance.new("SurfaceGui")
+    signText.Parent = sign
+    signText.CanvasSize = Vector2.new(800, 200)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1,0,1,0)
+    lbl.Text = "PRISON"
+    lbl.TextScaled = true
+    lbl.BackgroundTransparency = 1
+    lbl.TextColor3 = Color3.fromRGB(255, 180, 80)
+    lbl.Parent = signText
+    endingSpawns.prison = CFrame.new(cellCenter + Vector3.new(0,3,0))
+
+    -- Loop room with teleport pad that sends players back to start endlessly
+    local loopModel = Instance.new("Model")
+    loopModel.Name = "LoopChamber"
+    loopModel.Parent = endingsFolder
+    local loopCenter = Vector3.new(-120, FLOOR_Y, 80)
+    local loopFloor = makePart(Vector3.new(20, 1, 50), BrickColor.new("Deep orange"), true, true, Enum.Material.Neon)
+    loopFloor.CFrame = CFrame.new(loopCenter.X, FLOOR_Y - 1, loopCenter.Z)
+    loopFloor.Parent = loopModel
+    local telePad = makePart(Vector3.new(10, 0.5, 10), BrickColor.new("Bright violet"), true, false, Enum.Material.ForceField)
+    telePad.Name = "LoopPad"
+    telePad.CFrame = CFrame.new(loopCenter + Vector3.new(0, -0.25, 20))
+    telePad.Parent = loopModel
+    local loopStart = CFrame.new(loopCenter + Vector3.new(0, 2, -15))
+    endingSpawns.loopStart = loopStart
+    telePad.Touched:Connect(function(hit)
+        local char = hit:FindFirstAncestorOfClass("Model")
+        if not char then return end
+        local plr = Players:GetPlayerFromCharacter(char)
+        if not plr then return end
+        local root = getRootPart(char)
+        if root then
+            root.CFrame = loopStart
+            root.AssemblyLinearVelocity = Vector3.new(0,0,0)
+        end
+    end)
+end
+
 local function makePart(sz, bc, anchored, canCollide, mat)
     local p         = Instance.new("Part")
     p.Size          = sz
@@ -267,6 +347,15 @@ local function pickWeighted(defs, total)
         if r <= cum then return name, def end
     end
     local n, d = next(defs); return n, d
+end
+
+-- Wavy path helpers (course not straight)
+local function pathOffset(z)
+    return PATH_AMPLITUDE * math.sin(-z / PATH_WAVELENGTH)
+end
+
+local function pathDerivative(z)
+    return (PATH_AMPLITUDE / PATH_WAVELENGTH) * math.cos(-z / PATH_WAVELENGTH)
 end
 
 local function getBiome(dist)
@@ -330,12 +419,13 @@ local function createSegment(idx, diff, runDist)
     model.Name   = "Segment_" .. idx
     local biome  = getBiome(runDist)
     local segZ   = -(idx * SEGMENT_LENGTH)
+    local segCenterX = pathOffset(segZ)
 
     -- Floor
     local floor = makePart(Vector3.new(SEGMENT_WIDTH, FLOOR_THICK, SEGMENT_LENGTH),
                             biome.floorBC, true, true)
     floor.Name   = "Floor"
-    floor.CFrame = CFrame.new(0, FLOOR_Y, segZ)
+    floor.CFrame = CFrame.new(segCenterX, FLOOR_Y, segZ)
     floor.Parent = model
     model.PrimaryPart = floor
 
@@ -344,7 +434,7 @@ local function createSegment(idx, diff, runDist)
         local wall = makePart(Vector3.new(2, 10, SEGMENT_LENGTH), biome.wallBC, true, false)
         wall.Transparency = 0.55
         wall.Name         = "Wall"
-        wall.CFrame       = CFrame.new(side * (SEGMENT_WIDTH / 2 + 1), FLOOR_Y + 5, segZ)
+        wall.CFrame       = CFrame.new(segCenterX + side * (SEGMENT_WIDTH / 2 + 1), FLOOR_Y + 5, segZ)
         wall.Parent       = model
     end
 
@@ -355,7 +445,7 @@ local function createSegment(idx, diff, runDist)
                                BrickColor.new("Institutional white"), true, false)
         div.Transparency = 0.65
         div.Name         = "LaneDivider"
-        div.CFrame       = CFrame.new(divX, FLOOR_Y + FLOOR_THICK / 2 + 0.07, segZ)
+        div.CFrame       = CFrame.new(segCenterX + divX, FLOOR_Y + FLOOR_THICK / 2 + 0.07, segZ)
         div.Parent       = model
     end
 
@@ -373,7 +463,7 @@ local function createSegment(idx, diff, runDist)
                 local obs  = makePart(Vector3.new(LANE_WIDTH - 0.8, h, 4),
                                        def.color, true, not def.hazard)
                 obs.Name   = "Obstacle_" .. typeName
-                obs.CFrame = CFrame.new(LANE_X[laneIdx], obsY, rowZ)
+                obs.CFrame = CFrame.new(segCenterX + LANE_X[laneIdx], obsY, rowZ)
                 if def.hazard then
                     obs.Material  = Enum.Material.Neon
                     obs.CanTouch  = true
@@ -382,10 +472,10 @@ local function createSegment(idx, diff, runDist)
                 if def.moving then
                     table.insert(movObstacles, {
                         part  = obs,
-                        minX  = LANE_X[math.max(1, laneIdx - 1)],
-                        maxX  = LANE_X[math.min(NUM_LANES, laneIdx + 1)],
+                        minX  = segCenterX + LANE_X[math.max(1, laneIdx - 1)],
+                        maxX  = segCenterX + LANE_X[math.min(NUM_LANES, laneIdx + 1)],
                         speed = 5,
-                        posX  = LANE_X[laneIdx],
+                        posX  = segCenterX + LANE_X[laneIdx],
                         dir   = 1,
                     })
                 end
@@ -410,6 +500,12 @@ local function createSegment(idx, diff, runDist)
                         pd.health = pd.health - 1
                         HealthUpdateEvt:FireClient(plr, pd.health, pd.maxHealth)
                     else
+                        pd.endingReason = pd.endingReason or "obstacle"
+                        local root = getRootPart(char)
+                        if root and endingSpawns.loopStart then
+                            root.CFrame = endingSpawns.loopStart
+                            root.AssemblyLinearVelocity = Vector3.new(0,0,0)
+                        end
                         local hum = char:FindFirstChildOfClass("Humanoid")
                         if hum then hum.Health = 0 end
                     end
@@ -424,12 +520,13 @@ local function createSegment(idx, diff, runDist)
         local typeName, def = pickWeighted(COL_DEFS, COL_TOTAL_W)
         local t    = math.random() * 0.80 + 0.10
         local colZ = segZ + (t - 0.5) * SEGMENT_LENGTH
-        local col  = makePart(Vector3.new(2, 2, 2), def.color, true, false)
+        local colSize = def.size or 2
+        local col  = makePart(Vector3.new(colSize, colSize, colSize), def.color, true, false)
         col.Name     = "Collectible_" .. typeName
         col.Shape    = Enum.PartType.Ball
         col.Material = Enum.Material.Neon
         col.CanTouch = true
-        col.CFrame   = CFrame.new(LANE_X[laneIdx], FLOOR_Y + FLOOR_THICK / 2 + 2, colZ)
+        col.CFrame   = CFrame.new(segCenterX + LANE_X[laneIdx], FLOOR_Y + FLOOR_THICK / 2 + colSize / 2, colZ)
         col.Parent   = model
         -- Tag currency collectibles for MagnetManager attraction
         if def.coinVal then CollectionService:AddTag(col, "Cupcake") end
@@ -446,7 +543,8 @@ local function createSegment(idx, diff, runDist)
             col:Destroy()
             if def.coinVal then
                 pd.score = pd.score + def.coinVal
-                if typeName == "energy_shard" then
+                pd.coinsCollected = (pd.coinsCollected or 0) + def.coinVal
+                if typeName == "energy_shard" or typeName == "mini_coin" or typeName == "mega_coin" then
                     pd.energyShards = (pd.energyShards or 0) + 1
                 elseif typeName == "data_cube" then
                     pd.dataCubes = (pd.dataCubes or 0) + 1
@@ -485,7 +583,7 @@ local function createSegment(idx, diff, runDist)
         magPart.Shape    = Enum.PartType.Ball
         magPart.Material = Enum.Material.Neon
         magPart.CanTouch = true
-        magPart.CFrame   = CFrame.new(LANE_X[laneIdx], FLOOR_Y + FLOOR_THICK / 2 + 2.5, magZ)
+        magPart.CFrame   = CFrame.new(segCenterX + LANE_X[laneIdx], FLOOR_Y + FLOOR_THICK / 2 + 2.5, magZ)
         magPart.Parent   = model
         CollectionService:AddTag(magPart, "MagnetPickup")
     end
@@ -544,7 +642,8 @@ local function setupCharacter(player, char, pd)
     end
     pd.rootPart = root
     pd.humanoid = hum
-    root.CFrame = CFrame.new(LANE_X[3], FLOOR_Y + FLOOR_THICK + 5, 15)
+    local startOffset = pathOffset(0)
+    root.CFrame = CFrame.new(startOffset + LANE_X[3], FLOOR_Y + FLOOR_THICK + 5, 15)
     for _, n in ipairs({ "RunnerAtt", "RunnerVel", "RunnerGyro" }) do
         local e = root:FindFirstChild(n); if e then e:Destroy() end
     end
@@ -578,10 +677,11 @@ local function setupCharacter(player, char, pd)
 end
 
 -- Run end
-local function endRun(player, pd)
+local function endRun(player, pd, reason)
     if pd.runEnded then return end
     pd.runEnded = true
     pd.isAlive  = false
+    pd.endingReason = reason or pd.endingReason
     local s           = DIFFICULTY[pd.difficulty] or DIFFICULTY.normal
     local persist     = getPersist(player)
     local runTime     = os.clock() - pd.runStartTime
@@ -589,7 +689,7 @@ local function endRun(player, pd)
     local noHitBonus  = pd.noHitBonus and math.floor(runTime * 5) or 0
     local scoreMult   = 1 + 0.15 * (persist.upgrades.score_mult or 0)
     local finalScore  = math.floor((rawScore * s.speedMult + noHitBonus) * scoreMult)
-    local currencyEarned = pd.energyShards + pd.dataCubes * 5
+    local currencyEarned = pd.coinsCollected or 0
     persist.currency = persist.currency + currencyEarned
     local ls = player:FindFirstChild("leaderstats")
     if ls then
@@ -599,14 +699,26 @@ local function endRun(player, pd)
     RunEndEvt:FireClient(player, {
         distance      = math.floor(pd.distanceTraveled),
         score         = finalScore,
-        coins         = pd.energyShards,
+        coins         = pd.coinsCollected,
         dataCubes     = pd.dataCubes,
         difficulty    = pd.difficulty,
         timeSurvived  = math.floor(runTime),
         noHitBonus    = noHitBonus,
         totalCurrency = persist.currency,
+        endingReason  = pd.endingReason or "unknown",
     })
     CurrencyUpdateEvt:FireClient(player, persist.currency)
+
+    -- Endless loop ending: auto-restart after a short pause
+    if pd.endingReason == "obstacle" then
+        task.delay(3, function()
+            if not player.Parent then return end
+            local diff = pd.difficulty or "normal"
+            buildTrack(diff)
+            initRun(player, diff)
+            player:LoadCharacter()
+        end)
+    end
 end
 
 -- Players
@@ -782,16 +894,26 @@ RunService.Heartbeat:Connect(function()
             continue
         end
 
-        -- Fall off track
+        local centerX = pathOffset(root.Position.Z)
+
+        -- Fall off track → prison ending
         if root.Position.Y < FLOOR_Y - 20 then
+            pd.endingReason = pd.endingReason or "fall"
             ObstacleHitEvt:FireClient(player, "fell_off_track")
-            hum.Health = 0
-            endRun(player, pd)
+            if endingSpawns.prison then
+                root.CFrame = endingSpawns.prison
+                root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            end
+            if pd.linearVelocity and pd.linearVelocity.Parent then
+                pd.linearVelocity.VectorVelocity = Vector3.new(0,0,0)
+            end
+            endRun(player, pd, "fall")
             continue
         end
 
         -- Exit track sides (out-of-bounds kill – walls are non-solid, crossing kills the player)
-        if math.abs(root.Position.X) > SEGMENT_WIDTH / 2 + 5 then
+        if math.abs(root.Position.X - centerX) > SEGMENT_WIDTH / 2 + 5 then
+            pd.endingReason = pd.endingReason or "out_of_bounds"
             ObstacleHitEvt:FireClient(player, "out_of_bounds")
             hum.Health = 0
             endRun(player, pd)
@@ -806,14 +928,17 @@ RunService.Heartbeat:Connect(function()
         end
 
         -- Update laneIndex from current X position (used by dash ability etc.)
-        local xPos = root.Position.X
+        local xPos = root.Position.X - centerX
         pd.laneIndex = math.clamp(math.floor((xPos + 20) / 10 + 0.5) + 1, 1, NUM_LANES)
 
         -- Apply velocity: forward speed + lateral hold-to-move
         if pd.linearVelocity and pd.linearVelocity.Parent then
             local spd  = pd.currentSpeed + (pd.speedBoost or 0)
+            local slope = pathDerivative(root.Position.Z)
+            local forwardDir = Vector3.new(slope, 0, -1).Unit
             local latV = (pd.lateralDir or 0) * (pd.lateralSpeed or LATERAL_SPEED)
-            pd.linearVelocity.VectorVelocity = Vector3.new(latV, 0, -spd)
+            local final = forwardDir * spd + Vector3.new(latV, 0, 0)
+            pd.linearVelocity.VectorVelocity = Vector3.new(final.X, 0, final.Z)
         end
 
         -- Body tilt for visual turn feedback
@@ -827,6 +952,15 @@ RunService.Heartbeat:Connect(function()
         local ls = player:FindFirstChild("leaderstats")
         if ls and ls:FindFirstChild("Distance") then
             ls.Distance.Value = math.floor(pd.distanceTraveled)
+        end
+
+        -- End-of-course ending (reach the end → die)
+        if pd.distanceTraveled >= END_DISTANCE then
+            pd.endingReason = pd.endingReason or "finish"
+            ObstacleHitEvt:FireClient(player, "finish_line")
+            hum.Health = 0
+            endRun(player, pd, "finish")
+            continue
         end
 
         -- Milestones
@@ -852,5 +986,6 @@ RunService.Heartbeat:Connect(function()
 end)
 
 -- Initial track build
+buildEndingScenes()
 buildTrack("normal")
 print("[runner] 5-lane endless runner initialised.")

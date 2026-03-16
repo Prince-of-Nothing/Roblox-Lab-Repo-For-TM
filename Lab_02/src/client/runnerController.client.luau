@@ -31,6 +31,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local player    = Players.LocalPlayer
 local playerGui = player.PlayerGui
+local SHOP_TOGGLE_KEY = Enum.KeyCode.B
 
 -- Wait for Remotes
 local Remotes           = ReplicatedStorage:WaitForChild("Remotes", 30)
@@ -157,6 +158,11 @@ local abilityLabel = makeLabel(hudGui, "AbilityLabel",
     "Charges: 1\n[Q]Phase [E]Invinc\n[R]Slow [F]Dash",
     Color3.fromRGB(200, 150, 255))
 
+-- Shop overlay toggle (top-right)
+local shopBtn = makeButton(hudGui, "ShopBtn",
+    UDim2.new(0.10,0,0.05,0), UDim2.new(0.88,0,0.01,0),
+    "SHOP (B)", Color3.fromRGB(80,140,200))
+
 -- Speed (bottom-left)
 local speedLabel = makeLabel(hudGui, "SpeedLabel",
     UDim2.new(0.16, 0, 0.06, 0),
@@ -173,7 +179,7 @@ local scoreLabel = makeLabel(hudGui, "ScoreLabel",
 local hintLabel = makeLabel(hudGui, "HintLabel",
     UDim2.new(0.60, 0, 0.04, 0),
     UDim2.new(0.20, 0, 0.95, 0),
-    "Hold A/D - Move Left/Right   Space - Jump   S - Slide   Q/E/R/F - Abilities",
+    "Hold A/D - Move Left/Right   Space - Jump   S - Slide   Q/E/R/F - Abilities   B - Shop",
     Color3.fromRGB(180,180,180), Color3.fromRGB(0,0,0), 0.7,
     Enum.Font.Gotham)
 
@@ -304,7 +310,7 @@ changeDiffBtn.ZIndex = 9
 
 local hubBtn = makeButton(resultsBg, "HubBtn",
     UDim2.new(0.70,0,0.09,0), UDim2.new(0.15,0,0.78,0),
-    "PROGRESSION HUB (Spend Currency)", Color3.fromRGB(180,100,50))
+    "OPEN SHOP (Upgrades)", Color3.fromRGB(180,100,50))
 hubBtn.ZIndex = 9
 
 -- ── Progression Hub Screen ────────────────────────────────────────────────────
@@ -320,7 +326,7 @@ hubBg.Parent                 = hubGui
 
 makeLabel(hubBg, "HubTitle",
     UDim2.new(0.70,0,0.10,0), UDim2.new(0.15,0,0.01,0),
-    "PROGRESSION HUB", Color3.fromRGB(255,200,50), Color3.fromRGB(0,0,0), 1,
+    "SHOP / UPGRADES", Color3.fromRGB(255,200,50), Color3.fromRGB(0,0,0), 1,
     Enum.Font.GothamBlack, 9)
 
 local currencyLabel = makeLabel(hubBg, "CurrencyLabel",
@@ -339,6 +345,7 @@ local UPGRADE_DISPLAY = {
 }
 
 local upgradeBtnRefs = {}
+local totalCurrency  = 0
 
 for i, upg in ipairs(UPGRADE_DISPLAY) do
     local col = (i-1) % 3
@@ -391,6 +398,15 @@ local hubPlayBtn = makeButton(hubBg, "PlayBtn",
     "START RUN", Color3.fromRGB(80,180,80))
 hubPlayBtn.ZIndex = 9
 
+local function toggleShop(show)
+    hubGui.Enabled = show
+    if show then
+        currencyLabel.Text = "Currency: " .. totalCurrency
+        resultsGui.Enabled = false
+        diffGui.Enabled    = false
+    end
+end
+
 -- ── Run State Tracking ────────────────────────────────────────────────────────
 local clientScore    = 0
 local clientDist     = 0
@@ -399,7 +415,6 @@ local maxHealth      = 3
 local currentShields = 0
 local currentCharges = 1
 local currentSpeed   = 1.0
-local totalCurrency  = 0
 
 -- ── HUD Update Helpers ────────────────────────────────────────────────────────
 local function updateHealthHUD(hp, maxHp, shields)
@@ -424,6 +439,20 @@ local function updateAbilityHUD(charges)
     end
     abilityLabel.Text = string.format("Charges: %d\n[Q]Phase [E]Invinc [R]Slow [F]Dash\n%s",
         charges, cdInfo ~= "" and cdInfo or "All abilities ready")
+end
+
+local function describeEnding(reason)
+    if reason == "fall" then
+        return "Fell from the track → sent to the prison cell."
+    elseif reason == "obstacle" then
+        return "Destroyed by an obstacle → endless loop restarting."
+    elseif reason == "finish" then
+        return "You reached the end of the course and met your fate."
+    elseif reason == "out_of_bounds" then
+        return "Left the course bounds."
+    else
+        return "Run ended."
+    end
 end
 
 local function showBanner(text, color, duration)
@@ -460,6 +489,12 @@ UserInputService.InputBegan:Connect(function(input, processed)
         PlayerSlideEvt:FireServer()
         slideLabel.Visible = true
         task.delay(0.9, function() slideLabel.Visible = false end)
+    end
+
+    -- Shop toggle (overlay upgrades)
+    if kc == SHOP_TOGGLE_KEY and not isRunActive then
+        toggleShop(not hubGui.Enabled)
+        return
     end
 
     -- Abilities
@@ -538,7 +573,7 @@ RunStartEvt.OnClientEvent:Connect(function(difficulty)
     hudGui.Enabled     = true
     resultsGui.Enabled = false
     diffGui.Enabled    = false
-    hubGui.Enabled     = false
+    toggleShop(false)
 
     local diffColor = DIFF_COLORS[difficulty] or Color3.fromRGB(200,200,200)
     diffLabel.Text       = (DIFF_NAMES[difficulty] or difficulty):upper()
@@ -615,13 +650,17 @@ RunEndEvt.OnClientEvent:Connect(function(data)
     -- Update total currency display
     totalCurrency = data.totalCurrency or 0
 
+    local endingReason = data.endingReason or "unknown"
+    local endingText   = describeEnding(endingReason)
+
     local statsText = string.format(
         "Difficulty:   %s\n\n" ..
         "Distance:     %d m\n" ..
         "Score:        %d\n" ..
         "Coins:        %d  |  Data Cubes: %d\n" ..
         "Time Survived: %d s\n" ..
-        "No-Hit Bonus: +%d\n\n" ..
+        "No-Hit Bonus: +%d\n" ..
+        "Ending:       %s\n\n" ..
         "Total Currency: %d  (earned: %d)",
         (DIFF_NAMES[data.difficulty] or data.difficulty or "?"):upper(),
         data.distance or 0,
@@ -629,11 +668,20 @@ RunEndEvt.OnClientEvent:Connect(function(data)
         data.coins    or 0, data.dataCubes  or 0,
         data.timeSurvived or 0,
         data.noHitBonus   or 0,
+        endingText,
         data.totalCurrency or 0,
-        (data.coins or 0) + (data.dataCubes or 0) * 5
+        data.coins or 0
     )
     resultStatsLabel.Text = statsText
     resultsGui.Enabled    = true
+
+    if endingReason == "obstacle" then
+        showBanner("Obstacle ending → Loop restarting...", Color3.fromRGB(255,120,120), 3)
+    elseif endingReason == "fall" then
+        showBanner("Sent to prison after falling!", Color3.fromRGB(255,200,80), 3)
+    elseif endingReason == "finish" then
+        showBanner("You reached the end!", Color3.fromRGB(180,255,220), 3)
+    end
 end)
 
 CurrencyUpdateEvt.OnClientEvent:Connect(function(amount)
@@ -691,17 +739,21 @@ end)
 
 hubBtn.MouseButton1Click:Connect(function()
     resultsGui.Enabled = false
-    hubGui.Enabled     = true
-    currencyLabel.Text = "Currency: " .. totalCurrency
+    toggleShop(true)
+end)
+
+shopBtn.MouseButton1Click:Connect(function()
+    if isRunActive then return end
+    toggleShop(true)
 end)
 
 hubBackBtn.MouseButton1Click:Connect(function()
-    hubGui.Enabled  = false
+    toggleShop(false)
     diffGui.Enabled = true
 end)
 
 hubPlayBtn.MouseButton1Click:Connect(function()
-    hubGui.Enabled = false
+    toggleShop(false)
     SelectDiffEvt:FireServer(currentDifficulty)
     RequestRunEvt:FireServer()
 end)
