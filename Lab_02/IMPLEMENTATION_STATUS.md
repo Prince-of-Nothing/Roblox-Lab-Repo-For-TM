@@ -1,192 +1,194 @@
-# Lab_02 - 5-Lane Endless Runner Implementation Status
+# Lab_02 - 3-Lane Endless Runner Implementation Status
 
-**Project**: EndlessRunner_5Lane
-**Last Updated**: March 17, 2026
-**Status**: ✅ **FULLY FUNCTIONAL**
+**Project**: Simple Endless Runner
+**Last Updated**: March 18, 2026
+**Status**: FUNCTIONAL
 
-## 📋 Project Overview
+## Project Overview
 
-A sophisticated 5-lane endless runner game with currency collection, upgrade progression, and special abilities. Players navigate discrete lanes (1-5) while avoiding obstacles, collecting items, and using abilities to survive increasingly difficult challenges.
+A 3-lane endless runner game with coin collection, obstacle avoidance, shop islands with purchasable upgrades, and a grace period system. Players run forward automatically while dodging obstacles, collecting coins, and purchasing temporary power-ups from periodic shop islands.
 
-## 📁 Current File Structure
+## File Structure
 
 ```
-Lab_02/
-├── default.project.json              # ✅ Rojo project configuration (FIXED)
-├── Runner (1)(2).rbxl               # Roblox place file
-└── src/
-    ├── client/
-    │   └── runnerController.client.luau    # ✅ REDESIGNED for 5-lane system
-    ├── server/
-    │   ├── MagnetManager.server.lua        # ✅ Magnet attraction system
-    │   └── ProgressionHub.server.lua       # ✅ 8-category upgrade system
-    └── ServerScriptService/
-        ├── Leaderstats.server.lua          # ✅ Currency tracking
-        └── runner.server.lua               # ✅ Core 5-lane game logic (ENHANCED)
+Lab_02/src/
+├── ServerScriptService/
+│   ├── Leaderstats.server.lua      # Player data initialization
+│   └── RunnerServer.server.lua     # Core game logic (807 lines)
+└── StarterPlayer/
+    └── StarterPlayerScripts/
+        └── RunnerController.client.lua   # Client movement & UI (489 lines)
 ```
 
-### 🗑️ Removed Files (Conflicts Resolved)
-- ❌ `src/server/runner.server.lua` (simple runner - DELETED)
-- ❌ `src/ServerScriptService/MagnetManager.server.lua` (duplicate - DELETED)
+## Game Systems
 
-## 🎮 Game Systems Status
+### Core Gameplay
+| Feature | Status | Details |
+|---------|--------|---------|
+| 3-Lane Movement | DONE | Lanes at X positions: -8, 0, 8 |
+| Constant Forward Motion | DONE | Base speed: 50 studs/sec |
+| Segment Generation | DONE | 50-stud segments, 8 ahead buffer |
+| Obstacle Spawning | DONE | 0-2 obstacles per segment (always 1 lane clear) |
+| Coin Collection | DONE | Distance-based (5 stud range), +1 coin each |
+| Death Detection | DONE | Fall below Y=40 or double-hit during grace |
 
-### ✅ Core Gameplay (WORKING)
-- **5-Lane Movement**: Discrete lane switching (positions: -20, -10, 0, 10, 20)
-- **Obstacle System**: 5 types (solid, low, high, hazard, moving barriers)
-- **Biome Progression**: 5 biomes with visual changes
-- **Difficulty Scaling**: 5 levels (Easy → Impossible)
-- **Health System**: 3 base HP + shields + upgrades
+### Lane System
+- **Lane Positions**: -8 (left), 0 (center), 8 (right)
+- **Strafe Speed**: 40 studs/sec
+- **Max X Boundary**: ±12 studs
 
-### ✅ Currency System (FULLY INTEGRATED)
-```
-Collectibles → Leaderstats → _G.playerPersist → ProgressionHub
-```
-- **Real-time Updates**: Immediate leaderstats.Coins updates on collection
-- **Persistent Storage**: Uses `_G.playerPersist[userId].currency`
-- **Proper Tagging**: Currency collectibles tagged as "Cupcake" for magnet attraction
-- **End-Run Processing**: Currency earned added to persistent storage after each run
+### Obstacle System
+| Pattern | Probability | Description |
+|---------|-------------|-------------|
+| No obstacles | 30% | Safe segment |
+| 1 obstacle | 40% | Single lane blocked |
+| 2 obstacles | 30% | Two lanes blocked (always 1 clear) |
 
-### ✅ Upgrade System (8 CATEGORIES - ALL WORKING)
+- **Obstacle Size**: 4x6x0.1 studs (wall-like)
+- **Collision**: Triggers coin loss or death
 
-| Upgrade ID | Name | Effect | Implementation Status |
-|------------|------|--------|----------------------|
-| `move_speed` | Movement Efficiency | Reduces lane switch cooldown | ✅ 0.05s reduction per level |
-| `ability_cap` | Ability Capacity | +1 ability charge per level | ✅ Applied in initRun() |
-| `ability_cd` | Ability Cooldown | 15% cooldown reduction per level | ✅ Applied in ability system |
-| `magnet_radius` | Magnet Radius | +5 studs attraction per level | ✅ Working in MagnetManager |
-| `start_slow` | Starting Speed Control | 8% slower start per level | ✅ Applied to base speed |
-| `score_mult` | Score Multiplier | 1.15x final score per level | ✅ Applied at run end |
-| `life_saver` | Life Saver | +1 max HP per level | ✅ Applied in initRun() |
-| `speed_up` | Speed Boost | 10% base speed increase per level | ✅ Applied to base speed |
+### Coin System
+- **Spawn Chance**: 60% per segment
+- **Coin Shape**: Pink/magenta cylinder
+- **Collection Range**: 5 studs
+- **Sound**: `rbxassetid://135904960416116`
 
-## 🎯 Controls & Input System
+### Grace Period System
+| State | Duration | Behavior |
+|-------|----------|----------|
+| Normal | - | First hit: lose 5 coins, enter grace |
+| Grace Period | 10 seconds | Second hit: instant death |
+| Shield Grace | 20 seconds | First hit: free (shield consumed), second hit: death |
 
-### Movement Controls
-- **A / Left Arrow**: Switch to left lane
-- **D / Right Arrow**: Switch to right lane
-- **Space**: Jump (clear low barriers)
-- **S / Down Arrow**: Slide (clear high barriers)
+- **Coin Loss Per Hit**: 5 coins
+- **Death if Coins < 0**: Yes
 
-### Special Abilities (Require Charges)
-- **Q**: Phase (pass through obstacles for 2s)
-- **E**: Invincibility (no collision damage for 3s)
-- **R**: Dash (instant teleport 2 lanes right)
-- **T**: Time Slow (reduce world speed to 35% for 4s)
+### Speed Boost Zones
+- **Spawn Chance**: 13% per segment
+- **Appearance**: Green rectangle (3x1x8 studs)
+- **Effect**: +30% speed for 5 seconds
+- **Visual**: Green particle effect, FOV increase (70→80)
+- **Sound**: `rbxassetid://83211426606907`
 
-## 🔧 Technical Architecture
+## Shop System
 
-### Remote Events System
+### Shop Island Spawning
+- **First Shop**: After ~16 segments
+- **Interval**: Every 40 seconds (~50 segments at base speed)
+- **Platform Size**: 30x2x20 studs (green-tinted)
+
+### Available Upgrades
+| Upgrade | Cost | Effect | Duration |
+|---------|------|--------|----------|
+| Speed Boost | 10 coins | +3 permanent forward speed | Run lifetime |
+| Shield Grace | 15 coins | 20s shield + 1 free hit | 20 seconds |
+
+### Shop Behavior
+- **Detection Range**: 25 studs from shop center
+- **Movement Mode**: Free movement (WASD), 30 studs/sec
+- **Purchase Method**: Touch the colored sign
+- **One-time Purchase**: Each shop item can only be bought once per shop
+
+## Remote Events
+
+| Event Name | Direction | Purpose |
+|------------|-----------|---------|
+| `RunnerAdvance` | Client→Server | Request next segment |
+| `ShopData` | Server→Client | Broadcast shop positions |
+| `ObstacleHit` | Server→Client | Notify grace period start |
+| `SpeedZoneHit` | Server→Client | Notify speed boost |
+| `DebugAddCoins` | Client→Server | Debug: random coin add/remove |
+
+## Client UI Elements
+
+| Element | Position | Purpose |
+|---------|----------|---------|
+| Coins Label | Top-right | Current coin count |
+| Distance Label | Top-right (below coins) | Distance to next shop |
+| Speed Label | Top-right (below distance) | Current speed + bonuses |
+| Grace Timer | Top-left | Countdown during grace period |
+| Shield Timer | Top-left (below grace) | Countdown during shield |
+| Shop Mode Label | Top-center | "SHOP MODE" indicator |
+| Debug Button | Top-left | "Luck?" random coin gambling |
+| Damage Overlay | Full screen | Red flash on obstacle hit |
+
+## Player Data Structure
+
+### leaderstats (Visible)
 ```lua
--- All systems use shared Remotes folder in ReplicatedStorage
-- LaneSwitch          # Discrete lane changes
-- UseAbility          # Ability activation
-- PlayerJump/Slide    # Obstacle avoidance
-- SelectDifficulty    # Difficulty selection
-- RequestRun          # Run initiation
-- CurrencyUpdate      # Real-time currency sync
-- HealthUpdate        # Health/shield updates
-- AbilityUpdate       # Ability charge updates
-- MagnetStatus        # Magnet activation state
+leaderstats/
+└── Coins (IntValue) = 0
 ```
 
-### Data Persistence
+### GameState (Hidden)
 ```lua
--- Format: _G.playerPersist[tostring(userId)]
-{
-    currency = number,  -- Total coins earned
-    upgrades = {        -- Upgrade levels (0-maxLevel)
-        move_speed = 0-3,
-        ability_cap = 0-3,
-        ability_cd = 0-3,
-        -- ... etc for all 8 upgrades
-    }
-}
+GameState/
+├── GracePeriodEnd (NumberValue) = 0        -- Timestamp
+├── ShieldGracePeriodEnd (NumberValue) = 0  -- Timestamp
+├── ShieldGraceHitUsed (BoolValue) = false
+├── SpeedBoostActive (BoolValue) = false
+├── GraceReducerActive (BoolValue) = false
+├── PermanentSpeedBonus (IntValue) = 0      -- From shop purchases
+├── TempSpeedBoostEnd (NumberValue) = 0     -- From green zones
+└── ShopsPurchased/ (Folder)                -- Track per-shop purchases
+    └── Shop_X_Speed/Shop_X_Grace (BoolValue)
 ```
 
-### Integration Points
-- **ProgressionHub ↔ Runner**: Uses `_G.ProgressionHubUpgrades` for definitions
-- **MagnetManager ↔ Runner**: Uses CollectionService "Cupcake" tags
-- **Currency Flow**: Runner → Leaderstats → Persistence → ProgressionHub
-- **Upgrade Application**: Read from persistence during `initRun()`
+## Controls
 
-## 🎨 UI Components
+| Input | Action |
+|-------|--------|
+| A / Left Arrow | Strafe left |
+| D / Right Arrow | Strafe right |
+| W / Up Arrow | Move forward (shop only) |
+| S / Down Arrow | Move backward (shop only) |
+| Space | Jump |
 
-### Main Game HUD
-- **Stats Panel**: Health, Shields, Abilities, Speed
-- **Difficulty Selection**: 5 difficulty buttons with visual feedback
-- **Run Controls**: Start/restart button with status indication
-- **Currency Display**: Real-time coin counter
-- **Controls Reference**: Help panel showing all keybinds
+## Camera System
+- **Type**: Fixed (script-controlled)
+- **Position**: 15 studs behind, 8 studs above player
+- **Look Target**: Player + 2 studs up
+- **FOV**: 70 normal, 80 during speed boost
 
-### Real-time Updates
-- Health/shield changes from server events
-- Currency updates on collectible pickup
-- Ability charge consumption and regeneration
-- Speed display during gameplay
+## Audio
+| Event | Sound ID |
+|-------|----------|
+| Coin Pickup | `rbxassetid://135904960416116` |
+| Obstacle Hit | `rbxassetid://138080762` |
+| Speed Zone | `rbxassetid://83211426606907` |
+| Shop Purchase | `rbxassetid://138273059623491` |
+| Shield Break | `rbxassetid://120459258956850` |
 
-## 🚀 Performance Optimizations
+## Constants Summary
 
-### Server-Side
-- **CollectionService**: Efficient tagged object management for collectibles
-- **Heartbeat Loop**: Optimized player data processing
-- **Segment Management**: Dynamic track generation with cleanup
-- **Object Pooling**: Obstacles and collectibles reused where possible
+### Server (RunnerServer)
+```lua
+SEGMENT_LENGTH = 50
+SEGMENT_WIDTH = 30
+START_Y = 50
+SEGMENTS_AHEAD = 8
+COIN_CHANCE = 0.6
+OBSTACLE_CHANCE = 0.35  -- (unused, pattern-based instead)
+COIN_LOSS_ON_HIT = 5
+GRACE_PERIOD = 10
+SHOP_SPAWN_INTERVAL = 40
+LANES = {-8, 0, 8}
+```
 
-### Client-Side
-- **Input Cooldowns**: Prevents spam clicking (0.15s base cooldown)
-- **Event-Driven UI**: Updates only on server events
-- **Efficient Rendering**: Minimal continuous UI updates
+### Client (RunnerController)
+```lua
+FORWARD_SPEED = 50
+STRAFE_SPEED = 40
+SHOP_MOVE_SPEED = 30
+MAX_X = 12
+SEGMENT_LENGTH = 50
+TRIGGER_MULT = 0.7
+```
 
-## 🐛 Known Issues & Limitations
-
-### ✅ Resolved Issues
-- ❌ File structure conflicts (simple vs 5-lane runner)
-- ❌ Client-server movement mismatch
-- ❌ Magnet system integration broken
-- ❌ Upgrade effects not connected to gameplay
-- ❌ Currency flow disconnected
-
-### 🔄 Potential Future Improvements
-- **DataStore Integration**: Replace `_G.playerPersist` with proper DataStore persistence
-- **Multiplayer Support**: Add racing/competitive modes
-- **More Collectibles**: Additional collectible types with unique effects
-- **Achievement System**: Unlock system for completing challenges
-- **Visual Polish**: Enhanced particle effects and animations
-- **Sound System**: Audio feedback for actions and events
-
-## 📊 Upgrade Balance
-
-### Cost Scaling
-- **Base Costs**: 50-120g depending on upgrade power
-- **Level Scaling**: `cost = baseCost × (currentLevel + 1)`
-- **Max Levels**: Most upgrades cap at level 3
-
-### Power Scaling
-- **Linear Scaling**: Most upgrades provide consistent % increases per level
-- **Diminishing Returns**: Built into cost scaling, not effect scaling
-- **Synergy Effects**: Upgrades work together (speed + magnet radius, etc.)
-
-## 🔄 Workflow Summary
-
-1. **Player starts run** → SelectDifficulty → RequestRun
-2. **Server initializes** → initRun() applies all upgrades to player data
-3. **Gameplay loop** → Lane switching, abilities, obstacle avoidance
-4. **Collectible pickup** → Updates leaderstats immediately, stores for end-run
-5. **Run completion** → Currency added to persistence, results sent to client
-6. **Between runs** → ProgressionHub available for upgrade purchases
-7. **Upgrade purchase** → Effects applied on next run initialization
-
----
-
-## 💡 Using This Documentation
-
-This file serves as a complete reference for the current implementation state. When working on the project:
-
-1. **Check architecture diagrams** to understand system interactions
-2. **Reference upgrade table** to see what's implemented vs missing
-3. **Use file structure** to locate specific components
-4. **Review integration points** to understand data flow
-5. **Check known issues** to avoid investigating resolved problems
-
-**Last Integration Test**: All systems verified working together - currency collection, upgrade purchases, upgrade effects, magnet system, 5-lane movement, abilities, and difficulty scaling.
+## Future Improvements
+- DataStore persistence for coins/progress
+- More shop upgrade types
+- Difficulty scaling over time
+- Power-up variety (magnet, multiplier, etc.)
+- Visual biome changes
+- Leaderboard system
