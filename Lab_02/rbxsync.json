@@ -1,0 +1,34 @@
+{
+  "name": "Lab_02",
+  "tree": "./src",
+  "assets": "./assets",
+  "config": {
+    "extractBinaryAssets": true,
+    "binaryAssetTypes": [
+      "Image",
+      "Mesh",
+      "Sound",
+      "Animation"
+    ],
+    "excludeServices": [
+      "CorePackages",
+      "RobloxPluginGuiService",
+      "CoreGui"
+    ],
+    "excludeClasses": [],
+    "scriptSourceMode": "external",
+    "terrainMode": "voxelData",
+    "csgMode": "assetReference",
+    "chunkSize": 1000,
+    "generateToolingFiles": true
+  },
+  "sync": {
+    "mode": "bidirectional",
+    "conflictResolution": "prompt",
+    "autoSync": false,
+    "watchPaths": [
+      "./src"
+    ]
+  },
+  "treeMapping": {}
+}

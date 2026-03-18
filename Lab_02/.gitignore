@@ -1,0 +1,7 @@
+
+# RbxSync
+.rbxsync/
+*.rbxl
+*.rbxlx
+.DS_Store
+Thumbs.db

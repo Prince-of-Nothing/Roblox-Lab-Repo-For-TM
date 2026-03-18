@@ -8,10 +8,10 @@
         "$path": "src/ServerScriptService/runner.server.lua"
       },
       "MagnetManager": {
-        "$path": "src/server/MagnetManager.server.lua"
+        "$path": "src/ServerScriptService/MagnetManager.server.lua"
       },
       "ProgressionHub": {
-        "$path": "src/server/ProgressionHub.server.lua"
+        "$path": "src/ServerScriptService/ProgressionHub.server.lua"
       },
       "Leaderstats": {
         "$path": "src/ServerScriptService/Leaderstats.server.lua"
@@ -22,7 +22,7 @@
       "StarterPlayerScripts": {
         "$className": "StarterPlayerScripts",
         "runnerController": {
-          "$path": "src/client/runnerController.client.luau"
+          "$path": "src/StarterPlayer/StarterPlayerScripts/runnerController.client.luau"
         }
       }
     },

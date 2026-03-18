@@ -1,0 +1,65 @@
+{
+  "children": [
+    {
+      "children": [],
+      "className": "ReplicatedStorage",
+      "filePaths": [
+        "C:\\Users\\Unknown\\Documents\\Repos\\Roblox-Lab-Repo-For-TM\\Lab_02\\src\\ReplicatedStorage"
+      ],
+      "name": "ReplicatedStorage"
+    },
+    {
+      "children": [],
+      "className": "ServerScriptService",
+      "filePaths": [
+        "C:\\Users\\Unknown\\Documents\\Repos\\Roblox-Lab-Repo-For-TM\\Lab_02\\src\\ServerScriptService"
+      ],
+      "name": "ServerScriptService"
+    },
+    {
+      "children": [],
+      "className": "ServerStorage",
+      "filePaths": [
+        "C:\\Users\\Unknown\\Documents\\Repos\\Roblox-Lab-Repo-For-TM\\Lab_02\\src\\ServerStorage"
+      ],
+      "name": "ServerStorage"
+    },
+    {
+      "children": [],
+      "className": "StarterGui",
+      "filePaths": [
+        "C:\\Users\\Unknown\\Documents\\Repos\\Roblox-Lab-Repo-For-TM\\Lab_02\\src\\StarterGui"
+      ],
+      "name": "StarterGui"
+    },
+    {
+      "children": [],
+      "className": "StarterPack",
+      "filePaths": [
+        "C:\\Users\\Unknown\\Documents\\Repos\\Roblox-Lab-Repo-For-TM\\Lab_02\\src\\StarterPack"
+      ],
+      "name": "StarterPack"
+    },
+    {
+      "children": [],
+      "className": "StarterPlayer",
+      "filePaths": [
+        "C:\\Users\\Unknown\\Documents\\Repos\\Roblox-Lab-Repo-For-TM\\Lab_02\\src\\StarterPlayer"
+      ],
+      "name": "StarterPlayer"
+    },
+    {
+      "children": [],
+      "className": "Workspace",
+      "filePaths": [
+        "C:\\Users\\Unknown\\Documents\\Repos\\Roblox-Lab-Repo-For-TM\\Lab_02\\src\\Workspace"
+      ],
+      "name": "Workspace"
+    }
+  ],
+  "className": "DataModel",
+  "filePaths": [
+    "C:\\Users\\Unknown\\Documents\\Repos\\Roblox-Lab-Repo-For-TM\\Lab_02\\src"
+  ],
+  "name": "game"
+}
