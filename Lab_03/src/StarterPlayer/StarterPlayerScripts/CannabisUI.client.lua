@@ -554,6 +554,8 @@ task.spawn(function()
 	-- Request an initial sync once all remote connections are established
 	if SyncGameStateEvent then
 		SyncGameStateEvent:FireServer()
+	else
+		warn("[DEBUG] SyncGameState event missing; UI cannot request initial state.")
 	end
 
 	print("[DEBUG 23] Cannabis UI Client fully initialized!")
