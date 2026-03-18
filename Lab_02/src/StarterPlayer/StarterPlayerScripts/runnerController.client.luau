@@ -28,30 +28,43 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 
+-- DEBUG: Test that script is running
+print("🟢 [RunnerController] Client script started successfully!")
+print("🟢 [RunnerController] Current time:", tick())
+
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
--- Wait for Remote Events
-local Remotes = ReplicatedStorage:WaitForChild("Remotes")
-local PlayerMoveEvt = Remotes:WaitForChild("PlayerMove")
-local FreeMovementEvt = Remotes:WaitForChild("FreeMovement")
-local ManualUpgradeEvt = Remotes:WaitForChild("ManualUpgrade")
-local RequestRunEvt = Remotes:WaitForChild("RequestRun")
+-- Wait for Remote Events with timeout to prevent hanging
+print("🔵 [RunnerController] Waiting for server RemoteEvents...")
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
+if not Remotes then
+    warn("❌ [RunnerController] Failed to find Remotes folder! Server may not be ready.")
+    return
+end
+print("✅ [RunnerController] Found Remotes folder")
+
+local PlayerMoveEvt = Remotes:WaitForChild("PlayerMove", 5)
+local FreeMovementEvt = Remotes:WaitForChild("FreeMovement", 5)
+local ManualUpgradeEvt = Remotes:WaitForChild("ManualUpgrade", 5)
+local RequestRunEvt = Remotes:WaitForChild("RequestRun", 5)
 
 -- Receive events from server
-local SpeedUpdateEvt = Remotes:WaitForChild("SpeedUpdate")
-local HealthUpdateEvt = Remotes:WaitForChild("HealthUpdate")
-local RunEndEvt = Remotes:WaitForChild("RunEnd")
-local RunStartEvt = Remotes:WaitForChild("RunStart")
-local BiomeChangeEvt = Remotes:WaitForChild("BiomeChange")
-local CurrencyUpdateEvt = Remotes:WaitForChild("CurrencyUpdate")
-local CoinCollectedEvt = Remotes:WaitForChild("CoinCollected")
-local MilestoneEvt = Remotes:WaitForChild("MilestoneUIEvent")
-local MobDamageEvt = Remotes:WaitForChild("MobDamage")
-local SpeedUpgradeEvt = Remotes:WaitForChild("SpeedUpgrade")
-local LavaHitEvt = Remotes:WaitForChild("LavaHit")
-local MobSpawnEvt = Remotes:WaitForChild("MobSpawn")
-local ZoneEnterEvt = Remotes:WaitForChild("ZoneEnter")
+local SpeedUpdateEvt = Remotes:WaitForChild("SpeedUpdate", 5)
+local HealthUpdateEvt = Remotes:WaitForChild("HealthUpdate", 5)
+local RunEndEvt = Remotes:WaitForChild("RunEnd", 5)
+local RunStartEvt = Remotes:WaitForChild("RunStart", 5)
+local BiomeChangeEvt = Remotes:WaitForChild("BiomeChange", 5)
+local CurrencyUpdateEvt = Remotes:WaitForChild("CurrencyUpdate", 5)
+local CoinCollectedEvt = Remotes:WaitForChild("CoinCollected", 5)
+local MilestoneEvt = Remotes:WaitForChild("MilestoneUIEvent", 5)
+local MobDamageEvt = Remotes:WaitForChild("MobDamage", 5)
+local SpeedUpgradeEvt = Remotes:WaitForChild("SpeedUpgrade", 5)
+local LavaHitEvt = Remotes:WaitForChild("LavaHit", 5)
+local MobSpawnEvt = Remotes:WaitForChild("MobSpawn", 5)
+local ZoneEnterEvt = Remotes:WaitForChild("ZoneEnter", 5)
+
+print("✅ [RunnerController] All RemoteEvents loaded successfully!")
 
 -- Game State
 local inRun = false
@@ -613,7 +626,7 @@ local controlFrame = createFrame({
     Parent = screenGui
 })
 
-local startButton = createButton({
+local controlStartButton = createButton({
     Size = UDim2.new(1, -12, 0, 50),
     Position = UDim2.new(0, 6, 0, 5),
     Text = "Start Escape Run",
@@ -776,6 +789,19 @@ print("[RunnerController] Central HUD children count:", #centralHUD:GetChildren(
 for _, child in pairs(centralHUD:GetChildren()) do
     print("  - Child:", child.Name, "Type:", child.ClassName)
 end
+
+-- DEBUG: Test overlay visibility for 3 seconds
+task.spawn(function()
+    task.wait(3)
+    print("🟡 [RunnerController] DEBUG: Testing overlay visibility...")
+    centralHUD.Visible = true
+    centralStatusLabel.Text = "🔧 DEBUG: Overlay test - should be visible!"
+    centralStatusLabel.TextColor3 = Color3.fromRGB(255, 255, 0)
+    print("🟡 [RunnerController] DEBUG: Overlay should be visible now")
+    task.wait(5)
+    print("🟡 [RunnerController] DEBUG: Hiding overlay")
+    centralHUD.Visible = false
+end)
 
 -- Event handlers for start and upgrade buttons
 startButton.MouseButton1Click:Connect(function()
