@@ -1,837 +1,448 @@
 --[[
-  runnerController.client.luau
-  5-Lane Endless Runner - Client Input and UI
+  runnerController.client.luau - 5-Lane Endless Runner Client
+  ==============================================================
 
   Controls:
-    A / Left Arrow    - move left one lane
-    D / Right Arrow   - move right one lane
-    Space             - jump (clears low barriers)
-    S / Down Arrow    - slide (clears high barriers)
-    Q                 - ability: phase through obstacles
-    E                 - ability: invincibility
-    R                 - ability: time slow
-    F                 - ability: dash (2 lanes right)
+  A/Left  - Switch to left lane
+  D/Right - Switch to right lane
+  Space   - Jump (clear low barriers)
+  S/Down  - Slide (clear high barriers)
+
+  Abilities (require charges):
+  Q - Phase (pass through obstacles)
+  E - Invincibility (no collision damage)
+  R - Dash (instant lane teleport)
+  T - Time Slow (reduce world speed)
 
   UI:
-    Top-left:    Health and shield indicators
-    Top-centre:  Difficulty label
-    Top-right:   Ability charge counter
-    Bottom-left: Speed multiplier
-    Bottom-centre: Distance and score
-    Centre:      Biome change notification / milestone banner
-    Full-screen: Difficulty selection (before first run)
-    Full-screen: Results screen (after run ends)
-    Full-screen: Progression hub (between runs)
+  - Health and shield indicators
+  - Ability charge counter
+  - Difficulty selection (Easy/Normal/Medium/Hard/Impossible)
+  - Run start/restart controls
+  - Real-time stats display
 --]]
 
-local Players           = game:GetService("Players")
-local UserInputService  = game:GetService("UserInputService")
-local RunService        = game:GetService("RunService")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ContextActionService = game:GetService("ContextActionService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
 
-local player    = Players.LocalPlayer
-local playerGui = player.PlayerGui
-local SHOP_TOGGLE_KEY = Enum.KeyCode.B
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
 
--- Wait for Remotes
-local Remotes           = ReplicatedStorage:WaitForChild("Remotes", 30)
-local LaneSwitchEvt     = Remotes:WaitForChild("LaneSwitch",       20)
-local PlayerJumpEvt     = Remotes:WaitForChild("PlayerJump",       20)
-local PlayerSlideEvt    = Remotes:WaitForChild("PlayerSlide",      20)
-local UseAbilityEvt     = Remotes:WaitForChild("UseAbility",       20)
-local SelectDiffEvt     = Remotes:WaitForChild("SelectDifficulty", 20)
-local BuyUpgradeEvt     = Remotes:WaitForChild("BuyUpgrade",       20)
-local RequestRunEvt     = Remotes:WaitForChild("RequestRun",       20)
-local RunnerAdvanceEvt  = Remotes:WaitForChild("RunnerAdvance",    20)
-local RequestShopStateEvt = Remotes:WaitForChild("RequestShopState", 20)
-local LaneMoveStartEvt  = Remotes:WaitForChild("LaneMoveStart",    20)
-local LaneMoveStopEvt   = Remotes:WaitForChild("LaneMoveStop",     20)
+-- Wait for Remote Events
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local LaneSwitchEvt = Remotes:WaitForChild("LaneSwitch")
+local UseAbilityEvt = Remotes:WaitForChild("UseAbility")
+local PlayerJumpEvt = Remotes:WaitForChild("PlayerJump")
+local PlayerSlideEvt = Remotes:WaitForChild("PlayerSlide")
+local SelectDiffEvt = Remotes:WaitForChild("SelectDifficulty")
+local RequestRunEvt = Remotes:WaitForChild("RequestRun")
 
-local SpeedUpdateEvt    = Remotes:WaitForChild("SpeedUpdate",      20)
-local MilestoneEvt      = Remotes:WaitForChild("MilestoneUIEvent", 20)
-local HealthUpdateEvt   = Remotes:WaitForChild("HealthUpdate",     20)
-local ShieldUpdateEvt   = Remotes:WaitForChild("ShieldUpdate",     20)
-local AbilityUpdateEvt  = Remotes:WaitForChild("AbilityUpdate",    20)
-local RunEndEvt         = Remotes:WaitForChild("RunEnd",           20)
-local RunStartEvt       = Remotes:WaitForChild("RunStart",         20)
-local BiomeChangeEvt    = Remotes:WaitForChild("BiomeChange",      20)
-local CurrencyUpdateEvt = Remotes:WaitForChild("CurrencyUpdate",   20)
-local UpgradeResultEvt  = Remotes:WaitForChild("UpgradeResult",    20)
-local ObstacleHitEvt    = Remotes:WaitForChild("ObstacleHit",      20)
-local AbilityCDEvt      = Remotes:WaitForChild("AbilityCooldown",  20)
-local MagnetStatusEvt   = Remotes:WaitForChild("MagnetStatus",     20)
-local ComboUpdateEvt    = Remotes:WaitForChild("ComboUpdate",      20)
-local ObjectiveUpdateEvt = Remotes:WaitForChild("ObjectiveUpdate", 20)
+-- Receive events from server
+local SpeedUpdateEvt = Remotes:WaitForChild("SpeedUpdate")
+local HealthUpdateEvt = Remotes:WaitForChild("HealthUpdate")
+local ShieldUpdateEvt = Remotes:WaitForChild("ShieldUpdate")
+local AbilityUpdateEvt = Remotes:WaitForChild("AbilityUpdate")
+local RunEndEvt = Remotes:WaitForChild("RunEnd")
+local RunStartEvt = Remotes:WaitForChild("RunStart")
+local BiomeChangeEvt = Remotes:WaitForChild("BiomeChange")
+local CurrencyUpdateEvt = Remotes:WaitForChild("CurrencyUpdate")
+local MilestoneEvt = Remotes:WaitForChild("MilestoneUIEvent")
+local AbilityCDEvt = Remotes:WaitForChild("AbilityCooldown")
 
--- Game state
-local currentLane       = 3     -- 1-5
-local NUM_LANES         = 5
-local isRunActive       = false
-local currentDifficulty = "normal"
-local abilityCooldowns  = {}    -- { abilityName = endTime }
-local lastAdvancePos    = nil
-local ADVANCE_DIST      = 50
+-- Game State
+local currentLane = 3  -- Start in center lane (lanes 1-5)
+local inRun = false
+local selectedDifficulty = "normal"
 
--- Difficulty display names
-local DIFF_NAMES = {
-    easy="Easy", normal="Normal", medium="Medium", hard="Hard", impossible="Impossible"
-}
-local DIFF_COLORS = {
-    easy      = Color3.fromRGB(80, 200, 80),
-    normal    = Color3.fromRGB(80, 150, 255),
-    medium    = Color3.fromRGB(255, 180, 50),
-    hard      = Color3.fromRGB(255, 80, 80),
-    impossible= Color3.fromRGB(200, 50, 200),
+-- UI State
+local health = 3
+local maxHealth = 3
+local shields = 0
+local abilityCharges = 1
+local speed = 0
+local currency = 0
+
+-- Ability cooldowns (in seconds)
+local abilityCooldowns = {
+    phase = 0,
+    invincibility = 0,
+    dash = 0,
+    timeslow = 0
 }
 
--- ── Helper: Create ScreenGui ──────────────────────────────────────────────────
-local function makeGui(name, resetOnSpawn)
-    local gui = playerGui:FindFirstChild(name)
-    if not gui then
-        gui              = Instance.new("ScreenGui")
-        gui.Name         = name
-        gui.ResetOnSpawn = (resetOnSpawn == true)
-        gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-        gui.Parent       = playerGui
-    end
-    return gui
+-- Input handling with cooldowns
+local inputCooldown = 0.15  -- Prevent spam clicking
+local lastInputTime = 0
+
+local function canInput()
+    return os.clock() - lastInputTime >= inputCooldown
 end
 
-local function makeLabel(parent, name, size, pos, text, textColor, bgColor, bgTrans, font, zIndex)
-    local lbl                   = Instance.new("TextLabel")
-    lbl.Name                    = name
-    lbl.Size                    = size
-    lbl.Position                = pos
-    lbl.Text                    = text
-    lbl.TextColor3              = textColor or Color3.fromRGB(255,255,255)
-    lbl.BackgroundColor3        = bgColor   or Color3.fromRGB(0,0,0)
-    lbl.BackgroundTransparency  = bgTrans   ~= nil and bgTrans or 0.45
-    lbl.TextScaled              = true
-    lbl.Font                    = font or Enum.Font.GothamBold
-    lbl.ZIndex                  = zIndex or 1
-    lbl.Parent                  = parent
-    return lbl
+local function recordInput()
+    lastInputTime = os.clock()
 end
 
-local function makeButton(parent, name, size, pos, text, bgColor)
-    local btn               = Instance.new("TextButton")
-    btn.Name                = name
-    btn.Size                = size
-    btn.Position            = pos
-    btn.Text                = text
-    btn.TextColor3          = Color3.fromRGB(255,255,255)
-    btn.BackgroundColor3    = bgColor or Color3.fromRGB(50,50,50)
-    btn.TextScaled          = true
-    btn.Font                = Enum.Font.GothamBold
-    btn.ZIndex              = 5
-    btn.Parent              = parent
-    return btn
-end
+-- Lane switching functions
+local function switchLane(direction)
+    if not inRun or not canInput() then return end
 
--- ── Main HUD ─────────────────────────────────────────────────────────────────
-local hudGui = makeGui("RunnerHUD", false)
-hudGui.Enabled = false
-
--- Health bar (top-left)
-local healthFrame = Instance.new("Frame")
-healthFrame.Name             = "HealthFrame"
-healthFrame.Size             = UDim2.new(0.18, 0, 0.07, 0)
-healthFrame.Position         = UDim2.new(0.01, 0, 0.01, 0)
-healthFrame.BackgroundColor3 = Color3.fromRGB(0,0,0)
-healthFrame.BackgroundTransparency = 0.4
-healthFrame.Parent           = hudGui
-
-local healthLabel = makeLabel(healthFrame, "HealthLabel",
-    UDim2.new(1,0,0.55,0), UDim2.new(0,0,0,0),
-    "HP: ♥ ♥ ♥", Color3.fromRGB(255,80,80), Color3.fromRGB(0,0,0), 1)
-local shieldLabel = makeLabel(healthFrame, "ShieldLabel",
-    UDim2.new(1,0,0.45,0), UDim2.new(0,0,0.55,0),
-    "Shield: 0", Color3.fromRGB(180,220,255), Color3.fromRGB(0,0,0), 1)
-
--- Difficulty label (top-centre)
-local diffLabel = makeLabel(hudGui, "DiffLabel",
-    UDim2.new(0.18, 0, 0.05, 0),
-    UDim2.new(0.41, 0, 0.01, 0),
-    "NORMAL", Color3.fromRGB(80,150,255))
-
--- Ability charges (top-right)
-local abilityLabel = makeLabel(hudGui, "AbilityLabel",
-    UDim2.new(0.22, 0, 0.07, 0),
-    UDim2.new(0.77, 0, 0.01, 0),
-    "Charges: 1\n[Q]Phase [E]Invinc\n[R]Slow [F]Dash",
-    Color3.fromRGB(200, 150, 255))
-
--- Shop overlay toggle (top-right)
-local shopBtn = makeButton(hudGui, "ShopBtn",
-    UDim2.new(0.10,0,0.05,0), UDim2.new(0.88,0,0.01,0),
-    "SHOP (B)", Color3.fromRGB(80,140,200))
-
--- Speed (bottom-left)
-local speedLabel = makeLabel(hudGui, "SpeedLabel",
-    UDim2.new(0.16, 0, 0.06, 0),
-    UDim2.new(0.01, 0, 0.88, 0),
-    "Speed: 1.0x", Color3.fromRGB(255,255,255))
-
--- Score + Distance (bottom-centre)
-local scoreLabel = makeLabel(hudGui, "ScoreLabel",
-    UDim2.new(0.30, 0, 0.06, 0),
-    UDim2.new(0.35, 0, 0.88, 0),
-    "Score: 0  |  Dist: 0 m", Color3.fromRGB(255,220,100))
-
-local comboLabel = makeLabel(hudGui, "ComboLabel",
-    UDim2.new(0.16, 0, 0.06, 0),
-    UDim2.new(0.83, 0, 0.88, 0),
-    "Combo x1", Color3.fromRGB(255, 180, 80))
-
-local objectiveLabel = makeLabel(hudGui, "ObjectiveLabel",
-    UDim2.new(0.40, 0, 0.05, 0),
-    UDim2.new(0.30, 0, 0.82, 0),
-    "Objective: -", Color3.fromRGB(180, 255, 180), Color3.fromRGB(0,0,0), 0.45, Enum.Font.Gotham)
-
--- Controls hint (very bottom)
-local hintLabel = makeLabel(hudGui, "HintLabel",
-    UDim2.new(0.60, 0, 0.04, 0),
-    UDim2.new(0.20, 0, 0.95, 0),
-    "Hold A/D - Move Left/Right   Space - Jump   S - Slide   Q/E/R/F - Abilities   B - Shop",
-    Color3.fromRGB(180,180,180), Color3.fromRGB(0,0,0), 0.7,
-    Enum.Font.Gotham)
-
--- Biome / milestone banner (centre)
-local bannerLabel = makeLabel(hudGui, "BannerLabel",
-    UDim2.new(0.60, 0, 0.10, 0),
-    UDim2.new(0.20, 0, 0.07, 0),
-    "", Color3.fromRGB(255,215,0), Color3.fromRGB(0,0,0), 0.35)
-bannerLabel.Visible = false
-
--- Obstacle hit flash (full-screen red)
-local hitFlash                      = Instance.new("Frame")
-hitFlash.Name                       = "HitFlash"
-hitFlash.Size                       = UDim2.new(1,0,1,0)
-hitFlash.BackgroundColor3           = Color3.fromRGB(255,0,0)
-hitFlash.BackgroundTransparency     = 1
-hitFlash.ZIndex                     = 10
-hitFlash.Parent                     = hudGui
-
--- Slide indicator
-local slideLabel = makeLabel(hudGui, "SlideLabel",
-    UDim2.new(0.12, 0, 0.05, 0),
-    UDim2.new(0.44, 0, 0.82, 0),
-    "SLIDING", Color3.fromRGB(100,255,200))
-slideLabel.Visible = false
-
--- Ability active labels
-local abilActiveLabel = makeLabel(hudGui, "AbilActiveLabel",
-    UDim2.new(0.20, 0, 0.05, 0),
-    UDim2.new(0.40, 0, 0.76, 0),
-    "", Color3.fromRGB(200,150,255))
-abilActiveLabel.Visible = false
-
--- ── Difficulty Selection Screen ───────────────────────────────────────────────
-local diffGui = makeGui("DifficultySelect", false)
-diffGui.Enabled = true
-
-local diffBg = Instance.new("Frame")
-diffBg.Size                  = UDim2.new(1,0,1,0)
-diffBg.BackgroundColor3      = Color3.fromRGB(5,5,20)
-diffBg.BackgroundTransparency = 0.0
-diffBg.ZIndex                = 4
-diffBg.Parent                = diffGui
-
-makeLabel(diffBg, "Title",
-    UDim2.new(0.8,0,0.12,0), UDim2.new(0.10,0,0.03,0),
-    "ENDLESS RUNNER", Color3.fromRGB(255,220,50), Color3.fromRGB(0,0,0), 1,
-    Enum.Font.GothamBlack, 5)
-
-makeLabel(diffBg, "Subtitle",
-    UDim2.new(0.8,0,0.06,0), UDim2.new(0.10,0,0.16,0),
-    "Select Difficulty", Color3.fromRGB(180,180,255), Color3.fromRGB(0,0,0), 1,
-    Enum.Font.GothamBold, 5)
-
-local diffDescLabel = makeLabel(diffBg, "DiffDesc",
-    UDim2.new(0.80,0,0.07,0), UDim2.new(0.10,0,0.22,0),
-    "Choose a difficulty to begin your run", Color3.fromRGB(200,200,200),
-    Color3.fromRGB(0,0,0), 1, Enum.Font.Gotham, 5)
-
-local DIFFICULTIES = {
-    { id="easy",       label="Easy",       desc="1 obstacle per row, 4 safe lanes. Learn movement and timing.",    color=Color3.fromRGB(80,200,80)   },
-    { id="normal",     label="Normal",     desc="2 obstacles per row, 3 safe lanes. Balanced challenge.",           color=Color3.fromRGB(80,150,255)  },
-    { id="medium",     label="Medium",     desc="3 obstacles per row, 2 safe lanes. Constant lane switching.",      color=Color3.fromRGB(255,180,50)  },
-    { id="hard",       label="Hard",       desc="4 obstacles per row, 1 safe lane. React precisely.",               color=Color3.fromRGB(255,80,80)   },
-    { id="impossible", label="IMPOSSIBLE", desc="Full lane blockage! Requires ability timing. Endgame challenge.",  color=Color3.fromRGB(200,50,200)  },
-}
-
-for i, diff in ipairs(DIFFICULTIES) do
-    local yPos = 0.29 + (i-1) * 0.12
-    local btn  = makeButton(diffBg, "DiffBtn_" .. diff.id,
-        UDim2.new(0.60,0,0.09,0), UDim2.new(0.20,0,yPos,0),
-        diff.label, diff.color)
-    btn.ZIndex = 6
-
-    -- Description next to button
-    local descLbl = makeLabel(diffBg, "Desc_" .. diff.id,
-        UDim2.new(0.60,0,0.05,0), UDim2.new(0.20,0,yPos+0.095,0),
-        diff.desc, Color3.fromRGB(180,180,180), Color3.fromRGB(0,0,0), 0.8,
-        Enum.Font.Gotham, 5)
-    descLbl.Visible = false
-
-    btn.MouseButton1Click:Connect(function()
-        currentDifficulty = diff.id
-        SelectDiffEvt:FireServer(diff.id)
-        RequestRunEvt:FireServer()
-        diffGui.Enabled = false
-    end)
-
-    btn.MouseEnter:Connect(function()
-        descLbl.Visible = true
-        diffDescLabel.Text = diff.desc
-    end)
-    btn.MouseLeave:Connect(function()
-        descLbl.Visible = false
-    end)
-end
-
--- ── Results Screen ────────────────────────────────────────────────────────────
-local resultsGui = makeGui("ResultsScreen", false)
-resultsGui.Enabled = false
-
-local resultsBg = Instance.new("Frame")
-resultsBg.Size                   = UDim2.new(1,0,1,0)
-resultsBg.BackgroundColor3       = Color3.fromRGB(5,5,20)
-resultsBg.BackgroundTransparency = 0.1
-resultsBg.ZIndex                 = 8
-resultsBg.Parent                 = resultsGui
-
-makeLabel(resultsBg, "RunOverTitle",
-    UDim2.new(0.70,0,0.12,0), UDim2.new(0.15,0,0.03,0),
-    "RUN OVER", Color3.fromRGB(255,80,80), Color3.fromRGB(0,0,0), 1,
-    Enum.Font.GothamBlack, 9)
-
-local resultStatsLabel = makeLabel(resultsBg, "StatsLabel",
-    UDim2.new(0.70,0,0.45,0), UDim2.new(0.15,0,0.17,0),
-    "Loading stats...", Color3.fromRGB(220,220,255), Color3.fromRGB(0,0,0), 0.5,
-    Enum.Font.GothamBold, 9)
-
-local retryBtn = makeButton(resultsBg, "RetryBtn",
-    UDim2.new(0.35,0,0.09,0), UDim2.new(0.15,0,0.66,0),
-    "RETRY SAME DIFFICULTY", Color3.fromRGB(50,180,80))
-retryBtn.ZIndex = 9
-
-local changeDiffBtn = makeButton(resultsBg, "ChangeDiffBtn",
-    UDim2.new(0.35,0,0.09,0), UDim2.new(0.52,0,0.66,0),
-    "CHANGE DIFFICULTY", Color3.fromRGB(80,100,200))
-changeDiffBtn.ZIndex = 9
-
-local hubBtn = makeButton(resultsBg, "HubBtn",
-    UDim2.new(0.70,0,0.09,0), UDim2.new(0.15,0,0.78,0),
-    "OPEN SHOP (Upgrades)", Color3.fromRGB(180,100,50))
-hubBtn.ZIndex = 9
-
--- ── Progression Hub Screen ────────────────────────────────────────────────────
-local hubGui = makeGui("ProgressionHub", false)
-hubGui.Enabled = false
-
-local hubBg = Instance.new("Frame")
-hubBg.Size                   = UDim2.new(1,0,1,0)
-hubBg.BackgroundColor3       = Color3.fromRGB(5,5,20)
-hubBg.BackgroundTransparency = 0.05
-hubBg.ZIndex                 = 8
-hubBg.Parent                 = hubGui
-
-makeLabel(hubBg, "HubTitle",
-    UDim2.new(0.70,0,0.10,0), UDim2.new(0.15,0,0.01,0),
-    "SHOP / UPGRADES", Color3.fromRGB(255,200,50), Color3.fromRGB(0,0,0), 1,
-    Enum.Font.GothamBlack, 9)
-
-local currencyLabel = makeLabel(hubBg, "CurrencyLabel",
-    UDim2.new(0.40,0,0.06,0), UDim2.new(0.30,0,0.11,0),
-    "Currency: 0", Color3.fromRGB(255,220,80), Color3.fromRGB(0,0,0), 0.5, Enum.Font.GothamBold, 9)
-
-local UPGRADE_DISPLAY = {
-    { id="move_speed",    label="Movement Efficiency",     desc="+20% lateral speed per level"  },
-    { id="ability_cap",   label="Ability Capacity",        desc="+1 ability charge per level"   },
-    { id="ability_cd",    label="Ability Cooldown",        desc="-15% cooldown per level"       },
-    { id="magnet_radius", label="Collection Magnet",       desc="+5 stud attraction range/level"},
-    { id="start_slow",    label="Speed Reducer",           desc="-8% start speed per level"     },
-    { id="score_mult",    label="Score Multiplier",        desc="+15% final score per level"    },
-    { id="life_saver",    label="Life Saver",              desc="+1 max HP per level"           },
-    { id="speed_up",      label="Speed Boost",             desc="+10% base speed per level"     },
-}
-
-local upgradeBtnRefs = {}
-local totalCurrency  = 0
-
-for i, upg in ipairs(UPGRADE_DISPLAY) do
-    local col = (i-1) % 3
-    local row = math.floor((i-1) / 3)
-    local xPos = 0.05 + col * 0.33
-    local yPos = 0.18 + row * 0.20   -- tighter row spacing to fit 3 rows
-
-    local frame = Instance.new("Frame")
-    frame.Size                  = UDim2.new(0.30, 0, 0.175, 0)  -- slightly shorter for 3-row fit
-    frame.Position              = UDim2.new(xPos, 0, yPos, 0)
-    frame.BackgroundColor3      = Color3.fromRGB(20,20,50)
-    frame.BackgroundTransparency = 0.3
-    frame.ZIndex                = 9
-    frame.Parent                = hubBg
-
-    local nameLbl = makeLabel(frame, "Name",
-        UDim2.new(1,0,0.35,0), UDim2.new(0,0,0,0),
-        upg.label, Color3.fromRGB(200,200,255), Color3.fromRGB(0,0,0), 1,
-        Enum.Font.GothamBold, 10)
-
-    local descLbl = makeLabel(frame, "Desc",
-        UDim2.new(1,0,0.25,0), UDim2.new(0,0,0.35,0),
-        upg.desc, Color3.fromRGB(160,160,200), Color3.fromRGB(0,0,0), 1,
-        Enum.Font.Gotham, 10)
-
-    local levelLbl = makeLabel(frame, "Level",
-        UDim2.new(0.5,0,0.25,0), UDim2.new(0,0,0.60,0),
-        "Lv 0 / 3", Color3.fromRGB(255,220,80), Color3.fromRGB(0,0,0), 1,
-        Enum.Font.Gotham, 10)
-
-    local buyBtn = makeButton(frame, "BuyBtn",
-        UDim2.new(0.48,0,0.30,0), UDim2.new(0.50,0,0.62,0),
-        "Buy", Color3.fromRGB(50,150,80))
-    buyBtn.ZIndex = 11
-
-    upgradeBtnRefs[upg.id] = { levelLbl=levelLbl, buyBtn=buyBtn, frame=frame }
-
-    buyBtn.MouseButton1Click:Connect(function()
-        BuyUpgradeEvt:FireServer(upg.id)
-    end)
-end
-
-local hubBackBtn = makeButton(hubBg, "BackBtn",
-    UDim2.new(0.30,0,0.07,0), UDim2.new(0.35,0,0.90,0),
-    "BACK TO DIFFICULTY SELECT", Color3.fromRGB(80,80,150))
-hubBackBtn.ZIndex = 9
-
-local hubPlayBtn = makeButton(hubBg, "PlayBtn",
-    UDim2.new(0.30,0,0.07,0), UDim2.new(0.35,0,0.82,0),
-    "START RUN", Color3.fromRGB(80,180,80))
-hubPlayBtn.ZIndex = 9
-
-local function toggleShop(show)
-    hubGui.Enabled = show
-    if show then
-        RequestShopStateEvt:FireServer()
-        currencyLabel.Text = "Currency: " .. totalCurrency
-        resultsGui.Enabled = false
-        diffGui.Enabled    = false
+    local newLane = currentLane + direction
+    if newLane >= 1 and newLane <= 5 then
+        currentLane = newLane
+        LaneSwitchEvt:FireServer(newLane)
+        recordInput()
     end
 end
 
--- ── Run State Tracking ────────────────────────────────────────────────────────
-local clientScore    = 0
-local clientDist     = 0
-local currentHealth  = 3
-local maxHealth      = 3
-local currentShields = 0
-local currentCharges = 1
-local currentSpeed   = 1.0
-
--- ── HUD Update Helpers ────────────────────────────────────────────────────────
-local function updateHealthHUD(hp, maxHp, shields)
-    local hearts = ""
-    for i = 1, maxHp do
-        hearts = hearts .. (i <= hp and "♥" or "♡")
-        if i < maxHp then hearts = hearts .. " " end
-    end
-    healthLabel.Text = "HP: " .. hearts
-    shieldLabel.Text = "Shield: " .. (shields > 0 and string.rep("🛡 ", shields) or "None")
+local function switchLeft()
+    switchLane(-1)
 end
 
-local function updateAbilityHUD(charges)
-    local cdInfo = ""
-    for name, endTime in pairs(abilityCooldowns) do
-        local remaining = endTime - os.clock()
-        if remaining > 0 then
-            cdInfo = cdInfo .. string.format("[%s CD:%.0fs] ", name:sub(1,3), remaining)
-        else
-            abilityCooldowns[name] = nil
+local function switchRight()
+    switchLane(1)
+end
+
+-- Movement abilities
+local function playerJump()
+    if not inRun or not canInput() then return end
+    PlayerJumpEvt:FireServer()
+    recordInput()
+end
+
+local function playerSlide()
+    if not inRun or not canInput() then return end
+    PlayerSlideEvt:FireServer()
+    recordInput()
+end
+
+-- Special abilities
+local function useAbility(abilityType)
+    if not inRun or abilityCooldowns[abilityType] > 0 then return end
+    if abilityCharges <= 0 then return end
+
+    UseAbilityEvt:FireServer(abilityType)
+end
+
+-- Bind input actions
+local function bindInputs()
+    -- Lane switching
+    ContextActionService:BindAction("SwitchLeft", function(_, state)
+        if state == Enum.UserInputState.Begin then
+            switchLeft()
         end
-    end
-    abilityLabel.Text = string.format("Charges: %d\n[Q]Phase [E]Invinc [R]Slow [F]Dash\n%s",
-        charges, cdInfo ~= "" and cdInfo or "All abilities ready")
-end
+        return Enum.ContextActionResult.Sink
+    end, false, Enum.KeyCode.A, Enum.KeyCode.Left)
 
-local function describeEnding(reason)
-    if reason == "fall" then
-        return "Fell from the track → sent to the prison cell."
-    elseif reason == "obstacle" then
-        return "Destroyed by an obstacle → endless loop restarting."
-    elseif reason == "finish" then
-        return "You reached the end of the course and met your fate."
-    elseif reason == "out_of_bounds" then
-        return "Left the course bounds."
-    else
-        return "Run ended."
-    end
-end
+    ContextActionService:BindAction("SwitchRight", function(_, state)
+        if state == Enum.UserInputState.Begin then
+            switchRight()
+        end
+        return Enum.ContextActionResult.Sink
+    end, false, Enum.KeyCode.D, Enum.KeyCode.Right)
 
-local function updateComboHUD(combo, mult)
-    comboLabel.Text = string.format("Combo x%d  (chain: %d)", mult or 1, combo or 0)
-    if (mult or 1) > 1 then
-        comboLabel.TextColor3 = Color3.fromRGB(255, 120, 80)
-    else
-        comboLabel.TextColor3 = Color3.fromRGB(255, 180, 80)
-    end
-end
+    -- Jump and slide
+    ContextActionService:BindAction("PlayerJump", function(_, state)
+        if state == Enum.UserInputState.Begin then
+            playerJump()
+        end
+        return Enum.ContextActionResult.Sink
+    end, false, Enum.KeyCode.Space)
 
-local function updateObjectiveHUD(obj)
-    if not obj then
-        objectiveLabel.Text = "Objective: -"
-        return
-    end
-    if obj.completed then
-        objectiveLabel.Text = string.format("Objective complete: %s (+%d)", obj.label or "Task", obj.bonus or 0)
-        objectiveLabel.TextColor3 = Color3.fromRGB(120, 255, 120)
-    else
-        objectiveLabel.Text = string.format("Objective: %s %d/%d", obj.label or "Task", obj.progress or 0, obj.target or 0)
-        objectiveLabel.TextColor3 = Color3.fromRGB(180, 255, 180)
-    end
-end
-
-local function showBanner(text, color, duration)
-    bannerLabel.Text    = text
-    bannerLabel.TextColor3 = color or Color3.fromRGB(255,215,0)
-    bannerLabel.Visible = true
-    task.delay(duration or 3, function()
-        if bannerLabel.Visible then bannerLabel.Visible = false end
-    end)
-end
-
--- ── Input State ───────────────────────────────────────────────────────────────
-local keyHeld = {}
-
-UserInputService.InputBegan:Connect(function(input, processed)
-    if processed then return end
-    local kc = input.KeyCode
-    keyHeld[kc] = true
-
-    -- Hold-to-move lateral: server applies continuous lateral velocity while held
-    if kc == Enum.KeyCode.A or kc == Enum.KeyCode.Left then
-        if isRunActive then LaneMoveStartEvt:FireServer(-1) end
-    elseif kc == Enum.KeyCode.D or kc == Enum.KeyCode.Right then
-        if isRunActive then LaneMoveStartEvt:FireServer(1) end
-    end
-
-    -- Jump
-    if kc == Enum.KeyCode.Space then
-        PlayerJumpEvt:FireServer()
-    end
-
-    -- Slide
-    if kc == Enum.KeyCode.S or kc == Enum.KeyCode.Down then
-        PlayerSlideEvt:FireServer()
-        slideLabel.Visible = true
-        task.delay(0.9, function() slideLabel.Visible = false end)
-    end
-
-    -- Shop toggle (overlay upgrades)
-    if kc == SHOP_TOGGLE_KEY and not isRunActive then
-        toggleShop(not hubGui.Enabled)
-        return
-    end
+    ContextActionService:BindAction("PlayerSlide", function(_, state)
+        if state == Enum.UserInputState.Begin then
+            playerSlide()
+        end
+        return Enum.ContextActionResult.Sink
+    end, false, Enum.KeyCode.S, Enum.KeyCode.Down)
 
     -- Abilities
-    if kc == Enum.KeyCode.Q then
-        UseAbilityEvt:FireServer("phase")
-        abilActiveLabel.Text    = "PHASING"
-        abilActiveLabel.TextColor3 = Color3.fromRGB(200,150,255)
-        abilActiveLabel.Visible = true
-        task.delay(2, function() abilActiveLabel.Visible = false end)
-    elseif kc == Enum.KeyCode.E then
-        UseAbilityEvt:FireServer("invincibility")
-        abilActiveLabel.Text    = "INVINCIBLE"
-        abilActiveLabel.TextColor3 = Color3.fromRGB(255,220,80)
-        abilActiveLabel.Visible = true
-        task.delay(3, function() abilActiveLabel.Visible = false end)
-    elseif kc == Enum.KeyCode.R then
-        UseAbilityEvt:FireServer("timeslow")
-        abilActiveLabel.Text    = "TIME SLOW"
-        abilActiveLabel.TextColor3 = Color3.fromRGB(80,200,255)
-        abilActiveLabel.Visible = true
-        task.delay(4, function() abilActiveLabel.Visible = false end)
-    elseif kc == Enum.KeyCode.F then
-        UseAbilityEvt:FireServer("dash")
-        abilActiveLabel.Text    = "DASH!"
-        abilActiveLabel.TextColor3 = Color3.fromRGB(255,150,80)
-        abilActiveLabel.Visible = true
-        task.delay(0.5, function() abilActiveLabel.Visible = false end)
+    ContextActionService:BindAction("UsePhase", function(_, state)
+        if state == Enum.UserInputState.Begin then
+            useAbility("phase")
+        end
+        return Enum.ContextActionResult.Sink
+    end, false, Enum.KeyCode.Q)
+
+    ContextActionService:BindAction("UseInvincibility", function(_, state)
+        if state == Enum.UserInputState.Begin then
+            useAbility("invincibility")
+        end
+        return Enum.ContextActionResult.Sink
+    end, false, Enum.KeyCode.E)
+
+    ContextActionService:BindAction("UseDash", function(_, state)
+        if state == Enum.UserInputState.Begin then
+            useAbility("dash")
+        end
+        return Enum.ContextActionResult.Sink
+    end, false, Enum.KeyCode.R)
+
+    ContextActionService:BindAction("UseTimeslow", function(_, state)
+        if state == Enum.UserInputState.Begin then
+            useAbility("timeslow")
+        end
+        return Enum.ContextActionResult.Sink
+    end, false, Enum.KeyCode.T)
+end
+
+bindInputs()
+
+-- UI Creation helpers
+local function createFrame(props)
+    local frame = Instance.new("Frame")
+    frame.BackgroundColor3 = props.BackgroundColor3 or Color3.fromRGB(20, 25, 30)
+    frame.BackgroundTransparency = props.BackgroundTransparency or 0.1
+    frame.BorderSizePixel = 0
+    frame.Size = props.Size or UDim2.new(0, 200, 0, 100)
+    frame.Position = props.Position or UDim2.new(0, 10, 0, 10)
+    frame.AnchorPoint = props.AnchorPoint or Vector2.new(0, 0)
+    if props.Parent then
+        frame.Parent = props.Parent
     end
-end)
+    return frame
+end
 
-UserInputService.InputEnded:Connect(function(input, _)
-    local kc = input.KeyCode
-    keyHeld[kc] = nil
-    -- Stop lateral movement when the key is released; pass direction so server
-    -- won't cancel an override from the opposite key still being held.
-    if kc == Enum.KeyCode.A or kc == Enum.KeyCode.Left then
-        if isRunActive then LaneMoveStopEvt:FireServer(-1) end
-    elseif kc == Enum.KeyCode.D or kc == Enum.KeyCode.Right then
-        if isRunActive then LaneMoveStopEvt:FireServer(1) end
+local function createLabel(props)
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Size = props.Size or UDim2.new(1, -12, 0, 30)
+    label.Position = props.Position or UDim2.new(0, 6, 0, 6)
+    label.Font = props.Font or Enum.Font.GothamSemibold
+    label.TextColor3 = props.TextColor3 or Color3.fromRGB(255, 255, 255)
+    label.TextScaled = props.TextScaled ~= false
+    label.Text = props.Text or ""
+    label.TextXAlignment = props.TextXAlignment or Enum.TextXAlignment.Left
+    if props.Parent then
+        label.Parent = props.Parent
     end
-end)
+    return label
+end
 
--- ── Distance-based RunnerAdvance ───────────────────────────────────────────────
-RunService.Heartbeat:Connect(function()
-    if not isRunActive then return end
-    local char = player.Character
-    if not char then lastAdvancePos = nil; return end
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if not root then return end
-
-    if not lastAdvancePos then
-        lastAdvancePos = root.Position
-        return
+local function createButton(props)
+    local button = Instance.new("TextButton")
+    button.Size = props.Size or UDim2.new(1, -12, 0, 35)
+    button.Position = props.Position or UDim2.new(0, 6, 0, 6)
+    button.BackgroundColor3 = props.BackgroundColor3 or Color3.fromRGB(45, 55, 65)
+    button.BorderSizePixel = 0
+    button.Font = props.Font or Enum.Font.Gotham
+    button.TextColor3 = props.TextColor3 or Color3.fromRGB(255, 255, 255)
+    button.TextScaled = props.TextScaled ~= false
+    button.Text = props.Text or "Button"
+    if props.Parent then
+        button.Parent = props.Parent
     end
+    return button
+end
 
-    if (root.Position - lastAdvancePos).Magnitude >= ADVANCE_DIST then
-        lastAdvancePos = root.Position
-        RunnerAdvanceEvt:FireServer()
-    end
-end)
+-- Main UI Setup
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "RunnerHUD"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = playerGui
 
--- ── Server Event Handlers ─────────────────────────────────────────────────────
+-- Game Stats Panel
+local statsFrame = createFrame({
+    Size = UDim2.new(0, 280, 0, 120),
+    Position = UDim2.new(0, 15, 0, 15),
+    Parent = screenGui
+})
 
-RunStartEvt.OnClientEvent:Connect(function(difficulty)
-    isRunActive       = true
-    currentLane       = 3
-    clientScore       = 0
-    clientDist        = 0
-    currentDifficulty = difficulty or "normal"
-    abilityCooldowns  = {}
-    lastAdvancePos    = nil
+local healthLabel = createLabel({
+    Size = UDim2.new(1, -12, 0, 25),
+    Position = UDim2.new(0, 6, 0, 5),
+    Text = "Health: 3/3",
+    TextColor3 = Color3.fromRGB(255, 100, 100),
+    Parent = statsFrame
+})
 
-    -- Ensure lateral movement is stopped for the new run
-    LaneMoveStopEvt:FireServer(0)
+local shieldLabel = createLabel({
+    Size = UDim2.new(1, -12, 0, 25),
+    Position = UDim2.new(0, 6, 0, 30),
+    Text = "Shields: 0",
+    TextColor3 = Color3.fromRGB(100, 200, 255),
+    Parent = statsFrame
+})
 
-    hudGui.Enabled     = true
-    resultsGui.Enabled = false
-    diffGui.Enabled    = false
-    toggleShop(false)
+local abilityLabel = createLabel({
+    Size = UDim2.new(1, -12, 0, 25),
+    Position = UDim2.new(0, 6, 0, 55),
+    Text = "Abilities: 1",
+    TextColor3 = Color3.fromRGB(200, 100, 255),
+    Parent = statsFrame
+})
 
-    local diffColor = DIFF_COLORS[difficulty] or Color3.fromRGB(200,200,200)
-    diffLabel.Text       = (DIFF_NAMES[difficulty] or difficulty):upper()
-    diffLabel.TextColor3 = diffColor
+local speedLabel = createLabel({
+    Size = UDim2.new(1, -12, 0, 25),
+    Position = UDim2.new(0, 6, 0, 80),
+    Text = "Speed: 0.0",
+    TextColor3 = Color3.fromRGB(100, 255, 100),
+    Parent = statsFrame
+})
 
-    updateHealthHUD(3, 3, 0)
-    updateAbilityHUD(1)
-    updateComboHUD(0, 1)
-    updateObjectiveHUD(nil)
+-- Difficulty Selection Panel
+local diffFrame = createFrame({
+    Size = UDim2.new(0, 250, 0, 180),
+    Position = UDim2.new(0, 15, 0, 150),
+    Parent = screenGui
+})
 
-    showBanner("RUN STARTED  |  " .. (DIFF_NAMES[difficulty] or difficulty):upper(),
-               diffColor, 2.5)
-end)
+local diffTitle = createLabel({
+    Size = UDim2.new(1, -12, 0, 25),
+    Position = UDim2.new(0, 6, 0, 5),
+    Text = "Select Difficulty",
+    Font = Enum.Font.GothamBold,
+    TextColor3 = Color3.fromRGB(255, 220, 100),
+    Parent = diffFrame
+})
 
-SpeedUpdateEvt.OnClientEvent:Connect(function(mult)
-    currentSpeed = mult
-    speedLabel.Text = string.format("Speed: %.1fx", mult)
-end)
+local difficulties = {"easy", "normal", "medium", "hard", "impossible"}
+local difficultyNames = {"Easy", "Normal", "Medium", "Hard", "Impossible"}
+local difficultyButtons = {}
 
-HealthUpdateEvt.OnClientEvent:Connect(function(hp, maxHp)
-    currentHealth = hp
-    maxHealth     = maxHp
-    updateHealthHUD(hp, maxHp, currentShields)
-    -- Flash red on damage
-    hitFlash.BackgroundTransparency = 0.3
-    task.delay(0.2, function() hitFlash.BackgroundTransparency = 1 end)
-end)
+for i, diff in ipairs(difficulties) do
+    local button = createButton({
+        Size = UDim2.new(1, -12, 0, 25),
+        Position = UDim2.new(0, 6, 0, 25 + (i-1) * 30),
+        Text = difficultyNames[i],
+        Parent = diffFrame
+    })
 
-ShieldUpdateEvt.OnClientEvent:Connect(function(shields)
-    currentShields = shields
-    updateHealthHUD(currentHealth, maxHealth, shields)
-end)
-
-AbilityUpdateEvt.OnClientEvent:Connect(function(charges)
-    currentCharges = charges
-    updateAbilityHUD(charges)
-end)
-
-AbilityCDEvt.OnClientEvent:Connect(function(abilityName, cd)
-    abilityCooldowns[abilityName] = os.clock() + cd
-    updateAbilityHUD(currentCharges)
-end)
-
-ComboUpdateEvt.OnClientEvent:Connect(function(combo, mult)
-    updateComboHUD(combo, mult)
-end)
-
-ObjectiveUpdateEvt.OnClientEvent:Connect(function(obj)
-    updateObjectiveHUD(obj)
-end)
-
-MilestoneEvt.OnClientEvent:Connect(function(distance)
-    clientDist = distance
-    scoreLabel.Text = string.format("Score: %d  |  Dist: %d m", clientScore, clientDist)
-    showBanner(string.format("MILESTONE: %d m reached!", distance),
-               Color3.fromRGB(255,215,0), 3)
-end)
-
-BiomeChangeEvt.OnClientEvent:Connect(function(biomeName)
-    showBanner("Entering: " .. biomeName, Color3.fromRGB(150,255,200), 3)
-end)
-
-ObstacleHitEvt.OnClientEvent:Connect(function(obsType)
-    if obsType == "out_of_bounds" then
-        showBanner("OUT OF BOUNDS!", Color3.fromRGB(255,80,80), 2)
-    elseif obsType == "fell_off_track" then
-        showBanner("FELL OFF TRACK!", Color3.fromRGB(255,80,80), 2)
-    else
-        showBanner("HIT: " .. obsType:gsub("_", " "):upper(), Color3.fromRGB(255,80,80), 1.5)
-    end
-end)
-
-MagnetStatusEvt.OnClientEvent:Connect(function(active, duration)
-    if active then
-        showBanner(string.format("MAGNET ACTIVE  (%ds)", duration or 10),
-                   Color3.fromRGB(80,150,255), (duration or 10))
-    end
-end)
-
-RunEndEvt.OnClientEvent:Connect(function(data)
-    isRunActive = false
-    hudGui.Enabled = false
-
-    -- Update total currency display
-    totalCurrency = data.totalCurrency or 0
-
-    local endingReason = data.endingReason or "unknown"
-    local endingText   = describeEnding(endingReason)
-
-    local statsText = string.format(
-        "Difficulty:   %s\n\n" ..
-        "Distance:     %d m\n" ..
-        "Score:        %d\n" ..
-        "Coins:        %d  |  Data Cubes: %d\n" ..
-        "Time Survived: %d s\n" ..
-        "No-Hit Bonus: +%d\n" ..
-        "Ending:       %s\n\n" ..
-        "Total Currency: %d  (earned: %d)",
-        (DIFF_NAMES[data.difficulty] or data.difficulty or "?"):upper(),
-        data.distance or 0,
-        data.score    or 0,
-        data.coins    or 0, data.dataCubes  or 0,
-        data.timeSurvived or 0,
-        data.noHitBonus   or 0,
-        endingText,
-        data.totalCurrency or 0,
-        data.coins or 0
-    )
-    resultStatsLabel.Text = statsText
-    resultsGui.Enabled    = true
-
-    if endingReason == "obstacle" then
-        showBanner("Obstacle ending → Loop restarting...", Color3.fromRGB(255,120,120), 3)
-    elseif endingReason == "fall" then
-        showBanner("Sent to prison after falling!", Color3.fromRGB(255,200,80), 3)
-    elseif endingReason == "finish" then
-        showBanner("You reached the end!", Color3.fromRGB(180,255,220), 3)
-    end
-end)
-
-CurrencyUpdateEvt.OnClientEvent:Connect(function(amount)
-    totalCurrency = amount
-    currencyLabel.Text = "Currency: " .. amount
-end)
-
-UpgradeResultEvt.OnClientEvent:Connect(function(success, idOrMsg, level, nextCost, maxLevel, name, desc)
-    if success == "info" then
-        -- Info update from ProgressionHub
-        local upgradeId = idOrMsg
-        local ref = upgradeBtnRefs[upgradeId]
-        if ref then
-            ref.levelLbl.Text = string.format("Lv %d / %d", level or 0, maxLevel or 3)
-            local cost = nextCost or 999
-            if (level or 0) >= (maxLevel or 3) then
-                ref.buyBtn.Text              = "MAX"
-                ref.buyBtn.BackgroundColor3  = Color3.fromRGB(100,100,100)
-                ref.buyBtn.Active            = false
+    button.MouseButton1Click:Connect(function()
+        selectedDifficulty = diff
+        -- Update button colors to show selection
+        for j, btn in ipairs(difficultyButtons) do
+            if j == i then
+                btn.BackgroundColor3 = Color3.fromRGB(100, 150, 200)
             else
-                ref.buyBtn.Text              = "Buy (" .. cost .. ")"
-                ref.buyBtn.BackgroundColor3  = Color3.fromRGB(50,150,80)
+                btn.BackgroundColor3 = Color3.fromRGB(45, 55, 65)
             end
         end
-    elseif success == true then
-        -- Successful purchase
-        local upgradeId = idOrMsg
-        local ref = upgradeBtnRefs[upgradeId]
-        if ref then
-            ref.levelLbl.Text = string.format("Lv %d / %d", level or 0, maxLevel or 3)
-            if (level or 0) >= (maxLevel or 3) then
-                ref.buyBtn.Text             = "MAX"
-                ref.buyBtn.BackgroundColor3 = Color3.fromRGB(100,100,100)
-            else
-                ref.buyBtn.Text = "Buy (" .. (nextCost or "?") .. ")"
-            end
-        end
-        showBanner("Upgrade purchased!", Color3.fromRGB(80,255,80), 2)
-    else
-        showBanner("Purchase failed: " .. tostring(idOrMsg), Color3.fromRGB(255,80,80), 2)
+    end)
+
+    difficultyButtons[i] = button
+end
+
+-- Set normal as default selected
+difficultyButtons[2].BackgroundColor3 = Color3.fromRGB(100, 150, 200)
+
+-- Run Control Panel
+local controlFrame = createFrame({
+    Size = UDim2.new(0, 200, 0, 80),
+    Position = UDim2.new(1, -220, 0, 15),
+    Parent = screenGui
+})
+
+local startButton = createButton({
+    Size = UDim2.new(1, -12, 0, 30),
+    Position = UDim2.new(0, 6, 0, 8),
+    Text = "Start Run",
+    BackgroundColor3 = Color3.fromRGB(50, 150, 50),
+    Parent = controlFrame
+})
+
+local currencyLabel = createLabel({
+    Size = UDim2.new(1, -12, 0, 25),
+    Position = UDim2.new(0, 6, 0, 45),
+    Text = "Coins: 0",
+    TextColor3 = Color3.fromRGB(255, 215, 0),
+    Parent = controlFrame
+})
+
+-- Controls Info Panel
+local controlsFrame = createFrame({
+    Size = UDim2.new(0, 300, 0, 150),
+    Position = UDim2.new(1, -320, 0, 110),
+    Parent = screenGui
+})
+
+local controlsTitle = createLabel({
+    Size = UDim2.new(1, -12, 0, 20),
+    Position = UDim2.new(0, 6, 0, 5),
+    Text = "Controls",
+    Font = Enum.Font.GothamBold,
+    TextColor3 = Color3.fromRGB(200, 200, 255),
+    Parent = controlsFrame
+})
+
+local controlsText = createLabel({
+    Size = UDim2.new(1, -12, 1, -30),
+    Position = UDim2.new(0, 6, 0, 25),
+    Text = "A/D - Switch Lanes\nSpace - Jump\nS - Slide\nQ - Phase\nE - Invincibility\nR - Dash\nT - Time Slow",
+    TextScaled = false,
+    TextSize = 14,
+    TextColor3 = Color3.fromRGB(200, 200, 200),
+    TextYAlignment = Enum.TextYAlignment.Top,
+    Parent = controlsFrame
+})
+
+-- Event handlers for start button
+startButton.MouseButton1Click:Connect(function()
+    if not inRun then
+        SelectDiffEvt:FireServer(selectedDifficulty)
+        RequestRunEvt:FireServer()
+        startButton.Text = "Running..."
+        startButton.BackgroundColor3 = Color3.fromRGB(150, 150, 50)
     end
 end)
 
--- ── Button Callbacks ──────────────────────────────────────────────────────────
-retryBtn.MouseButton1Click:Connect(function()
-    resultsGui.Enabled = false
-    SelectDiffEvt:FireServer(currentDifficulty)
-    RequestRunEvt:FireServer()
+-- Server event handlers
+SpeedUpdateEvt.Event:Connect(function(newSpeed)
+    speed = newSpeed
+    speedLabel.Text = string.format("Speed: %.1f", speed)
 end)
 
-changeDiffBtn.MouseButton1Click:Connect(function()
-    resultsGui.Enabled = false
-    diffGui.Enabled    = true
+HealthUpdateEvt.Event:Connect(function(newHealth, newMaxHealth)
+    health = newHealth
+    maxHealth = newMaxHealth
+    healthLabel.Text = string.format("Health: %d/%d", health, maxHealth)
 end)
 
-hubBtn.MouseButton1Click:Connect(function()
-    resultsGui.Enabled = false
-    toggleShop(true)
+ShieldUpdateEvt.Event:Connect(function(newShields)
+    shields = newShields
+    shieldLabel.Text = string.format("Shields: %d", shields)
 end)
 
-shopBtn.MouseButton1Click:Connect(function()
-    if isRunActive then return end
-    toggleShop(true)
+AbilityUpdateEvt.Event:Connect(function(newCharges)
+    abilityCharges = newCharges
+    abilityLabel.Text = string.format("Abilities: %d", abilityCharges)
 end)
 
-hubBackBtn.MouseButton1Click:Connect(function()
-    toggleShop(false)
-    diffGui.Enabled = true
+CurrencyUpdateEvt.Event:Connect(function(newCurrency)
+    currency = newCurrency
+    currencyLabel.Text = string.format("Coins: %d", currency)
 end)
 
-hubPlayBtn.MouseButton1Click:Connect(function()
-    toggleShop(false)
-    SelectDiffEvt:FireServer(currentDifficulty)
-    RequestRunEvt:FireServer()
+RunStartEvt.Event:Connect(function()
+    inRun = true
+    currentLane = 3
+    startButton.Text = "In Progress"
+    startButton.BackgroundColor3 = Color3.fromRGB(150, 100, 50)
 end)
 
--- ── Initialise HUD on load ────────────────────────────────────────────────────
-task.spawn(function()
-    task.wait(1)
-    updateHealthHUD(3, 3, 0)
-    updateAbilityHUD(1)
-    updateComboHUD(0, 1)
-    updateObjectiveHUD(nil)
-    speedLabel.Text = "Speed: 1.0x"
-    scoreLabel.Text = "Score: 0  |  Dist: 0 m"
+RunEndEvt.Event:Connect(function(results)
+    inRun = false
+    startButton.Text = "Start Run"
+    startButton.BackgroundColor3 = Color3.fromRGB(50, 150, 50)
+
+    -- Show run results (simplified for now)
+    print("Run completed! Distance:", results.distance, "Score:", results.score)
 end)
 
--- ── Score Update via Distance Tracking ───────────────────────────────────────
--- Update scoreLabel every heartbeat when run is active
-RunService.Heartbeat:Connect(function()
-    if not isRunActive then return end
-    local char = player.Character
-    if not char then return end
-    local ls = player:FindFirstChild("leaderstats")
-    if ls then
-        local scoreVal = ls:FindFirstChild("Score")
-        local distVal  = ls:FindFirstChild("Distance")
-        local coinsVal = ls:FindFirstChild("Coins")
-        if scoreVal and distVal then
-            scoreLabel.Text = string.format("Score: %d  |  Dist: %d m",
-                scoreVal.Value, distVal.Value)
+AbilityCDEvt.Event:Connect(function(abilityType, cooldownTime)
+    abilityCooldowns[abilityType] = cooldownTime
+end)
+
+-- Cooldown countdown
+RunService.Heartbeat:Connect(function(dt)
+    for ability, remaining in pairs(abilityCooldowns) do
+        if remaining > 0 then
+            abilityCooldowns[ability] = math.max(0, remaining - dt)
         end
     end
 end)
 
-print("[runnerController] Client script loaded.")
+print("[RunnerController] 5-Lane client controller loaded!")

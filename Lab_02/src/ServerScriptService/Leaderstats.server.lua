@@ -25,5 +25,10 @@ Players.PlayerAdded:Connect(function(player)
 	coins.Name = "Coins"
 	coins.Value = 0
 	coins.Parent = stats
+
+	local speedRatio = Instance.new("NumberValue")
+	speedRatio.Name = "SpeedRatio"
+	speedRatio.Value = 1
+	speedRatio.Parent = stats
 end)
 

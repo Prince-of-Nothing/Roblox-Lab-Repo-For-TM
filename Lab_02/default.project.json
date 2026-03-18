@@ -5,7 +5,7 @@
     "ServerScriptService": {
       "$className": "ServerScriptService",
       "runner": {
-        "$path": "src/server/runner.server.lua"
+        "$path": "src/ServerScriptService/runner.server.lua"
       },
       "MagnetManager": {
         "$path": "src/server/MagnetManager.server.lua"

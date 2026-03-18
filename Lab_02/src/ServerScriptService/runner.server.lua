@@ -194,15 +194,17 @@ local function initRun(player, diff)
     local upg   = persist.upgrades
     local startSlowBonus = (upg.start_slow or 0) * 0.08
     local abilCapBonus   = upg.ability_cap or 0
-    local baseSpd = BASE_FORWARD_SPEED * s.speedMult * (1 - startSlowBonus)
+    local speedUpBonus   = (upg.speed_up or 0) * 0.10
+    local lifeSaverBonus = upg.life_saver or 0
+    local baseSpd = BASE_FORWARD_SPEED * s.speedMult * (1 - startSlowBonus) * (1 + speedUpBonus)
     local pd = {
         difficulty       = diff,
         settings         = s,
         laneIndex        = 3,
         currentSpeed     = baseSpd,
         speedBoost       = 0,
-        health           = 3,
-        maxHealth        = 3,
+        health           = 3 + lifeSaverBonus,
+        maxHealth        = 3 + lifeSaverBonus,
         shields          = 0,
         abilityCharges   = 1 + abilCapBonus,
         maxAbilCharges   = 3 + abilCapBonus,
@@ -218,6 +220,7 @@ local function initRun(player, diff)
         isSliding        = false,
         noHitBonus       = true,
         abilityCooldown  = {},
+        lastLaneSwitch   = 0,  -- For move_speed upgrade
         linearVelocity   = nil,
         rootPart         = nil,
         humanoid         = nil,
@@ -605,8 +608,23 @@ end)
 LaneSwitchEvt.OnServerEvent:Connect(function(player, newLane)
     local pd = _G.playerRunData[player]
     if not pd or not pd.isAlive then return end
+
+    -- Apply move_speed upgrade (reduces lane switching delay)
+    local persist = getPersist(player)
+    local moveSpeedLevel = persist.upgrades.move_speed or 0
+    local baseCooldown = 0.15  -- Base lane switching cooldown in seconds
+    local cooldownReduction = moveSpeedLevel * 0.05  -- 0.05s reduction per level
+    local switchCooldown = math.max(0.05, baseCooldown - cooldownReduction)
+
+    local now = os.clock()
+    if now - pd.lastLaneSwitch < switchCooldown then
+        return -- Still on cooldown
+    end
+
     newLane = math.clamp(math.floor(tonumber(newLane) or 3), 1, NUM_LANES)
     pd.laneIndex = newLane
+    pd.lastLaneSwitch = now
+
     local root = pd.rootPart
     if root and root.Parent then
         root.CFrame = CFrame.new(LANE_X[newLane], root.Position.Y, root.Position.Z)
