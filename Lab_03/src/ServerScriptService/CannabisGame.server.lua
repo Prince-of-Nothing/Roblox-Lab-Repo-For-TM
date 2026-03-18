@@ -619,6 +619,13 @@ PurchaseUpgradeEvent.OnServerEvent:Connect(function(player, upgradeType)
 	purchaseUpgrade(player, upgradeType)
 end)
 
+-- Allow clients to request a fresh sync when their UI is ready
+SyncGameStateEvent.OnServerEvent:Connect(function(player)
+	if player and player:IsA("Player") and playerData[player] then
+		syncGameState(player)
+	end
+end)
+
 -- ========================
 -- PLAYER CONNECTIONS
 -- ========================

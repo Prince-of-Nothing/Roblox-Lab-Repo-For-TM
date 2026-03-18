@@ -551,6 +551,13 @@ task.spawn(function()
 	updateLeafCounter()
 	updateCannabisObtained()
 
+	-- Request an initial sync once all remote connections are established
+	if SyncGameStateEvent then
+		SyncGameStateEvent:FireServer()
+	else
+		warn("SyncGameState event missing; UI cannot request initial state.")
+	end
+
 	print("[DEBUG 23] Cannabis UI Client fully initialized!")
 end)
 
