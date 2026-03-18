@@ -32,6 +32,11 @@ print("[DEBUG 4] Variables initialized, creating GUI...")
 local playerGui = player:WaitForChild("PlayerGui")
 print("[DEBUG 5] PlayerGui found: " .. tostring(playerGui))
 
+local existingGui = playerGui:FindFirstChild("CannabisUI")
+if existingGui then
+	existingGui:Destroy()
+end
+
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "CannabisUI"
 screenGui.ResetOnSpawn = false
@@ -323,6 +328,9 @@ end
 
 local function updateShopButtons()
 	if not upgradeData.yieldLevel then return end
+	local yieldCosts = upgradeData.yieldCosts or {}
+	local plotCosts = upgradeData.plotCosts or {}
+	local autopickerCost = upgradeData.autopickerCost or 1000
 
 	-- Yield button
 	local yieldLevel = upgradeData.yieldLevel
@@ -330,7 +338,7 @@ local function updateShopButtons()
 		yieldButton.Text = "Yield Boost\nMAXED (5x)\n---"
 		yieldButton.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
 	else
-		local cost = upgradeData.yieldCosts[yieldLevel]
+		local cost = yieldCosts[yieldLevel] or "?"
 		yieldButton.Text = "Yield Boost\nLevel " .. yieldLevel .. "/5 (" .. yieldLevel .. "x)\nCost: " .. cost .. " Cannabis"
 		yieldButton.BackgroundColor3 = Color3.fromRGB(60, 100, 60)
 	end
@@ -341,7 +349,7 @@ local function updateShopButtons()
 		plotButton.Text = "Unlock Plot\nMAXED (6/6)\n---"
 		plotButton.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
 	else
-		local cost = upgradeData.plotCosts[maxPlots]
+		local cost = plotCosts[maxPlots] or "?"
 		plotButton.Text = "Unlock Plot\nPlots: " .. maxPlots .. "/6\nCost: " .. cost .. " Cannabis"
 		plotButton.BackgroundColor3 = Color3.fromRGB(60, 100, 60)
 	end
@@ -351,7 +359,7 @@ local function updateShopButtons()
 		autopickerButton.Text = "Autopicker\nACTIVE!\n---"
 		autopickerButton.BackgroundColor3 = Color3.fromRGB(60, 140, 60)
 	else
-		autopickerButton.Text = "Autopicker\nAuto-collect cannabis leaves!\nCost: " .. upgradeData.autopickerCost .. " Cannabis"
+		autopickerButton.Text = "Autopicker\nAuto-collect cannabis leaves!\nCost: " .. autopickerCost .. " Cannabis"
 		autopickerButton.BackgroundColor3 = Color3.fromRGB(60, 100, 60)
 	end
 end
@@ -456,7 +464,7 @@ mouse.Button1Down:Connect(function()
 			selectedPlotIndex = plotIndex
 			updatePlotInfoPanel()
 		end
-	-- Check if clicked on plant segment
+		-- Check if clicked on plant segment
 	elseif target.Name == "PlantSegment" then
 		local model = target.Parent
 		if model and model.Name:match("^CannabisPlant_") then
@@ -497,9 +505,29 @@ task.spawn(function()
 
 	if SyncGameStateEvent then
 		SyncGameStateEvent.OnClientEvent:Connect(function(newPlotStates, newUpgradeData)
+			print("[TASK 4] SYNC RECEIVED from server")
 			print("[DEBUG] Received game state sync from server")
-			plotStates = newPlotStates
-			upgradeData = newUpgradeData
+
+			-- TASK 6: Validate plot state data
+			print("[TASK 6] plotStates received:")
+			if newPlotStates then
+				local plotCount = 0
+				for i, plotData in pairs(newPlotStates) do
+					plotCount = plotCount + 1
+					print("[TASK 6] Plot " .. i .. " state: " .. (plotData.state or "nil"))
+				end
+				print("[TASK 6] Total plots: " .. plotCount .. "/6 expected")
+				if plotCount == 6 then
+					print("[TASK 6] ✅ PASSED - Table has 6 entries")
+				else
+					print("[TASK 6] ❌ FAILED - Expected 6 plots, got " .. plotCount)
+				end
+			else
+				print("[TASK 6] ❌ FAILED - plotStates is nil!")
+			end
+
+			plotStates = typeof(newPlotStates) == "table" and newPlotStates or {}
+			upgradeData = typeof(newUpgradeData) == "table" and newUpgradeData or {}
 			updateShopButtons()
 			updatePlotInfoPanel()
 			updateCannabisObtained()
@@ -526,9 +554,11 @@ task.spawn(function()
 	local stats = player:WaitForChild("leaderstats", 10)
 	if stats then
 		print("[DEBUG 21] leaderstats found")
+		print("[TASK 3] leaderstats found, checking Cannabis value...")
 		local leavesValue = stats:WaitForChild("Cannabis", 10) or stats:WaitForChild("Leaves", 10)
 		if leavesValue then
 			print("[DEBUG 22] Cannabis value found")
+			print("[TASK 3] Cannabis value from leaderstats: " .. leavesValue.Value)
 			leavesValue.Changed:Connect(function()
 				updateLeafCounter()
 			end)
@@ -552,8 +582,16 @@ task.spawn(function()
 	updateCannabisObtained()
 
 	-- Request an initial sync once all remote connections are established
+	-- TASK 5: Fire SyncGameState 10 times with delay for reliable sync
 	if SyncGameStateEvent then
-		SyncGameStateEvent:FireServer()
+		task.spawn(function()
+			for i = 1, 10 do
+				print("[TASK 5] Firing SyncGameState request #" .. i .. "/10")
+				SyncGameStateEvent:FireServer()
+				task.wait(0.5) -- 0.5 second delay between requests
+			end
+			print("[TASK 5] All 10 sync requests sent - client should eventually receive valid data")
+		end)
 	else
 		warn("SyncGameState event missing; UI cannot request initial state.")
 	end

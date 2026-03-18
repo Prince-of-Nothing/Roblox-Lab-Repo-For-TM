@@ -10,16 +10,21 @@
     },
     "StarterPlayer": {
       "$className": "StarterPlayer",
-      "StarterPlayerScripts": {
-        "$className": "StarterPlayerScripts",
-        "CannabisUI": {
-          "$path": "src/StarterPlayer/StarterPlayerScripts/CannabisUI.client.lua"
+        "StarterPlayerScripts": {
+          "$className": "StarterPlayerScripts",
+          "CannabisUI": {
+            "$className": "LocalScript",
+            "$path": "src/StarterPlayer/StarterPlayerScripts/CannabisUI.client.lua",
+            "$properties": {
+              "Disabled": false
+            }
+          }
         }
-      }
-    },
+      },
     "ReplicatedStorage": {
       "$className": "ReplicatedStorage",
       "PlantTypes": {
+        "$className": "ModuleScript",
         "$path": "src/ReplicatedStorage/PlantTypes.lua"
       }
     }
