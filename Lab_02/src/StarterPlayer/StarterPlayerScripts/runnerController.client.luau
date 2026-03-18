@@ -659,15 +659,39 @@ local gameplayText = createLabel({
     Parent = infoFrame
 })
 
--- Central Overlay HUD (shown during runs)
-local centralHUD = createFrame({
-    Size = UDim2.new(0, 400, 0, 200),
-    Position = UDim2.new(0.5, -200, 0.3, -100),
-    BackgroundColor3 = Color3.fromRGB(15, 20, 30),
-    BackgroundTransparency = 0.02,
-    Visible = false,
-    Parent = screenGui
-})
+-- Central Overlay HUD (shown during runs) - Direct creation for proper initialization
+local centralHUD = Instance.new("Frame")
+centralHUD.Name = "CentralHUD"
+centralHUD.Size = UDim2.new(0, 400, 0, 200)
+centralHUD.Position = UDim2.new(0.5, -200, 0.3, -100)
+centralHUD.BackgroundColor3 = Color3.fromRGB(15, 20, 30)
+centralHUD.BackgroundTransparency = 0.02
+centralHUD.BorderSizePixel = 0
+centralHUD.Visible = false
+centralHUD.Parent = screenGui
+
+-- Add rounded corners and stroke
+local centralCorner = Instance.new("UICorner")
+centralCorner.CornerRadius = UDim.new(0, 12)
+centralCorner.Parent = centralHUD
+
+local centralStroke = Instance.new("UIStroke")
+centralStroke.Thickness = 2
+centralStroke.Color = Color3.fromRGB(100, 100, 100)
+centralStroke.Transparency = 0.3
+centralStroke.Parent = centralHUD
+
+-- Debug: Print that central HUD was created
+print("[RunnerController] Central HUD overlay created and initialized!")
+print("[RunnerController] Central HUD Visible:", centralHUD.Visible)
+print("[RunnerController] Central HUD Parent:", centralHUD.Parent.Name)
+
+-- Debug: Test overlay visibility (uncomment for testing)
+-- task.wait(2)
+-- centralHUD.Visible = true
+-- print("[RunnerController] DEBUG: Central HUD forced visible for 3 seconds")
+-- task.wait(3)
+-- centralHUD.Visible = false
 
 -- Central status message
 local centralStatusLabel = createLabel({
@@ -713,20 +737,28 @@ local centralDistanceDisplay = createLabel({
     Parent = centralHUD
 })
 
--- Progress bar for central display
-local progressBarFrame = createFrame({
-    Size = UDim2.new(1, -20, 0, 8),
-    Position = UDim2.new(0, 10, 0, 135),
-    BackgroundColor3 = Color3.fromRGB(50, 50, 50),
-    Parent = centralHUD
-})
+-- Progress bar for central display - Direct creation
+local progressBarFrame = Instance.new("Frame")
+progressBarFrame.Size = UDim2.new(1, -20, 0, 8)
+progressBarFrame.Position = UDim2.new(0, 10, 0, 135)
+progressBarFrame.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+progressBarFrame.BorderSizePixel = 0
+progressBarFrame.Parent = centralHUD
 
-local progressBar = createFrame({
-    Size = UDim2.new(0, 0, 1, 0),
-    Position = UDim2.new(0, 0, 0, 0),
-    BackgroundColor3 = Color3.fromRGB(100, 255, 100),
-    Parent = progressBarFrame
-})
+local progressBarCorner = Instance.new("UICorner")
+progressBarCorner.CornerRadius = UDim.new(0, 4)
+progressBarCorner.Parent = progressBarFrame
+
+local progressBar = Instance.new("Frame")
+progressBar.Size = UDim2.new(0, 0, 1, 0)
+progressBar.Position = UDim2.new(0, 0, 0, 0)
+progressBar.BackgroundColor3 = Color3.fromRGB(100, 255, 100)
+progressBar.BorderSizePixel = 0
+progressBar.Parent = progressBarFrame
+
+local progressCorner = Instance.new("UICorner")
+progressCorner.CornerRadius = UDim.new(0, 4)
+progressCorner.Parent = progressBar
 
 -- Central upgrade info
 local centralUpgradeLabel = createLabel({
@@ -738,6 +770,12 @@ local centralUpgradeLabel = createLabel({
     TextColor3 = Color3.fromRGB(200, 200, 200),
     Parent = centralHUD
 })
+
+-- Debug: Check that all child elements were created
+print("[RunnerController] Central HUD children count:", #centralHUD:GetChildren())
+for _, child in pairs(centralHUD:GetChildren()) do
+    print("  - Child:", child.Name, "Type:", child.ClassName)
+end
 
 -- Event handlers for start and upgrade buttons
 startButton.MouseButton1Click:Connect(function()
@@ -1088,13 +1126,16 @@ RunStartEvt.Event:Connect(function()
     startButton.BackgroundColor3 = Color3.fromRGB(150, 100, 50)
 
     -- Show central HUD and fade in
+    print("[RunnerController] Showing central HUD overlay!")
     centralHUD.Visible = true
     centralHUD.BackgroundTransparency = 1
+    print("[RunnerController] Central HUD Visible set to:", centralHUD.Visible)
     local fadeIn = TweenService:Create(centralHUD,
         TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
         { BackgroundTransparency = 0.02 }
     )
     fadeIn:Play()
+    print("[RunnerController] Central HUD fade-in animation started!")
 
     -- Update central status
     centralStatusLabel.Text = "🏃 Escape started! Reach 1000m to survive!"
