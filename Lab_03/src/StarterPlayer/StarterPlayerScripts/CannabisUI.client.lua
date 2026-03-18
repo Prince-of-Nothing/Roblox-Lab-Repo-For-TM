@@ -555,7 +555,7 @@ task.spawn(function()
 	if SyncGameStateEvent then
 		SyncGameStateEvent:FireServer()
 	else
-		warn("[DEBUG] SyncGameState event missing; UI cannot request initial state.")
+		warn("SyncGameState event missing; UI cannot request initial state.")
 	end
 
 	print("[DEBUG 23] Cannabis UI Client fully initialized!")

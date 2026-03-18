@@ -621,7 +621,9 @@ end)
 
 -- Allow clients to request a fresh sync when their UI is ready
 SyncGameStateEvent.OnServerEvent:Connect(function(player)
-	syncGameState(player)
+	if player and player:IsA("Player") and playerData[player] then
+		syncGameState(player)
+	end
 end)
 
 -- ========================
