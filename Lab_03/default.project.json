@@ -1,0 +1,27 @@
+{
+  "name": "CannabisIdleGame",
+  "tree": {
+    "$className": "DataModel",
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "CannabisGame": {
+        "$path": "src/ServerScriptService/CannabisGame.server.lua"
+      }
+    },
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "CannabisUI": {
+          "$path": "src/StarterPlayer/StarterPlayerScripts/CannabisUI.client.lua"
+        }
+      }
+    },
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "PlantTypes": {
+        "$path": "src/ReplicatedStorage/PlantTypes.lua"
+      }
+    }
+  }
+}
